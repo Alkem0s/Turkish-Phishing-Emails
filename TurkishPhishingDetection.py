@@ -1,19 +1,23 @@
 """
 Turkish Phishing Email Detection Project
-Streamlined Implementation with Transformer Models
+PyTorch Implementation with Transformer Models
 """
 
-import tensorflow as tf
-from transformers import TFAutoModel, AutoTokenizer, MarianMTModel, MarianTokenizer
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer, MarianMTModel, MarianTokenizer
+from transformers import AdamW, get_linear_schedule_with_warmup
 import pandas as pd
 import numpy as np
 import re
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 import pickle
 import warnings
+from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 
@@ -36,7 +40,7 @@ class EmailData:
 # DATA LOADING
 # ============================================================================
 
-class DataLoader:
+class DataLoaderUtil:
     """Handles loading and splitting phishing email datasets"""
     
     def __init__(self, data_path: str):
@@ -63,10 +67,12 @@ class DataLoader:
 class MachineTranslator:
     """Handles translation from English to Turkish using Marian NMT"""
     
-    def __init__(self):
+    def __init__(self, device: str = None):
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         model_name = "Helsinki-NLP/opus-mt-en-tr"
         self.tokenizer = MarianTokenizer.from_pretrained(model_name)
-        self.model = MarianMTModel.from_pretrained(model_name)
+        self.model = MarianMTModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
     
     def translate_email(self, email: EmailData) -> EmailData:
         """Translate email while preserving URLs and metadata"""
@@ -84,8 +90,10 @@ class MachineTranslator:
     
     def _translate_text(self, text: str) -> str:
         """Translate plain text"""
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-        translated = self.model.generate(**inputs)
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, 
+                               truncation=True, max_length=512).to(self.device)
+        with torch.no_grad():
+            translated = self.model.generate(**inputs)
         return self.tokenizer.decode(translated[0], skip_special_tokens=True)
     
     def _translate_with_urls(self, text: str, urls: List[str]) -> str:
@@ -105,7 +113,7 @@ class MachineTranslator:
     
     def batch_translate_dataset(self, emails: List[EmailData]) -> List[EmailData]:
         """Translate entire dataset"""
-        return [self.translate_email(email) for email in emails]
+        return [self.translate_email(email) for email in tqdm(emails, desc="Translating")]
 
 
 # ============================================================================
@@ -205,31 +213,75 @@ class TextPreprocessor:
 
 
 # ============================================================================
+# PYTORCH DATASET
+# ============================================================================
+
+class EmailDataset(Dataset):
+    """PyTorch Dataset for email data"""
+    
+    def __init__(self, emails: List[EmailData], tokenizer, preprocessor, 
+                 feature_extractor, max_length: int = 512):
+        self.emails = emails
+        self.tokenizer = tokenizer
+        self.preprocessor = preprocessor
+        self.feature_extractor = feature_extractor
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.emails)
+    
+    def __getitem__(self, idx):
+        email = self.emails[idx]
+        text = self.preprocessor.preprocess(email)
+        
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        heuristic_features = list(self.feature_extractor.extract_features(email).values())
+        
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'heuristic_features': torch.tensor(heuristic_features, dtype=torch.float32),
+            'labels': torch.tensor(email.label, dtype=torch.long)
+        }
+
+
+# ============================================================================
 # TRANSFORMER MODEL
 # ============================================================================
 
-class TransformerClassifier(tf.keras.Model):
+class TransformerClassifier(nn.Module):
     """Transformer-based classifier with heuristic feature fusion"""
     
-    def __init__(self, model_name: str, num_labels: int = 2, heuristic_dim: int = 13):
+    def __init__(self, model_name: str, num_labels: int = 2, heuristic_dim: int = 13, dropout: float = 0.3):
         super().__init__()
         self.model_name = model_name
-        self.transformer = TFAutoModel.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.dropout = tf.keras.layers.Dropout(0.3)
-        self.heuristic_dense = tf.keras.layers.Dense(32, activation='relu')
-        self.classifier = tf.keras.layers.Dense(num_labels, activation='softmax')
+        self.transformer = AutoModel.from_pretrained(model_name)
+        self.dropout = nn.Dropout(dropout)
+        self.heuristic_dense = nn.Linear(heuristic_dim, 32)
+        self.relu = nn.ReLU()
+        
+        # Get transformer hidden size
+        hidden_size = self.transformer.config.hidden_size
+        self.classifier = nn.Linear(hidden_size + 32, num_labels)
     
-    def call(self, inputs, training=False):
+    def forward(self, input_ids, attention_mask, heuristic_features):
         """Forward pass combining transformer and heuristic features"""
         transformer_out = self.transformer(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask']
+            input_ids=input_ids,
+            attention_mask=attention_mask
         )
         
-        pooled = self.dropout(transformer_out.last_hidden_state[:, 0, :], training=training)
-        heuristic = self.heuristic_dense(inputs['heuristic_features'])
-        combined = tf.keras.layers.Concatenate()([pooled, heuristic])
+        # Use [CLS] token representation
+        pooled = self.dropout(transformer_out.last_hidden_state[:, 0, :])
+        heuristic = self.relu(self.heuristic_dense(heuristic_features))
+        combined = torch.cat([pooled, heuristic], dim=1)
         
         return self.classifier(combined)
 
@@ -242,89 +294,194 @@ class PhishingDetector:
     """Main detector class for training and evaluation"""
     
     def __init__(self, model_name: str, max_length: int = 512, learning_rate: float = 2e-5,
-                 batch_size: int = 16, epochs: int = 3, patience: int = 2):
+                 batch_size: int = 16, epochs: int = 3, patience: int = 2, device: str = None):
         self.model_name = model_name
         self.max_length = max_length
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.epochs = epochs
         self.patience = patience
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         
-        self.model = TransformerClassifier(model_name)
+        self.model = TransformerClassifier(model_name).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.preprocessor = TextPreprocessor()
         self.feature_extractor = HeuristicFeatureExtractor()
+        
+        print(f"Using device: {self.device}")
     
-    def prepare_dataset(self, emails: List[EmailData]) -> tf.data.Dataset:
-        """Convert emails to TensorFlow dataset"""
-        texts = [self.preprocessor.preprocess(email) for email in emails]
-        labels = [email.label for email in emails]
-        
-        encodings = self.tokenizer(texts, truncation=True, padding='max_length',
-                                   max_length=self.max_length, return_tensors='tf')
-        
-        heuristic_features = np.array([
-            list(self.feature_extractor.extract_features(email).values())
-            for email in emails
-        ])
-        
-        dataset_dict = {
-            'input_ids': encodings['input_ids'],
-            'attention_mask': encodings['attention_mask'],
-            'heuristic_features': tf.constant(heuristic_features, dtype=tf.float32)
-        }
-        
-        return tf.data.Dataset.from_tensor_slices((dataset_dict, tf.constant(labels, dtype=tf.int32)))
+    def create_dataloader(self, emails: List[EmailData], shuffle: bool = False) -> DataLoader:
+        """Create PyTorch DataLoader"""
+        dataset = EmailDataset(
+            emails, self.tokenizer, self.preprocessor, 
+            self.feature_extractor, self.max_length
+        )
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
     
     def train(self, train_emails: List[EmailData], val_emails: List[EmailData]):
         """Train the model"""
-        train_dataset = self.prepare_dataset(train_emails).shuffle(1000).batch(self.batch_size)
-        val_dataset = self.prepare_dataset(val_emails).batch(self.batch_size)
+        train_loader = self.create_dataloader(train_emails, shuffle=True)
+        val_loader = self.create_dataloader(val_emails, shuffle=False)
         
-        self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate),
-            loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
-            metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
+        # Setup optimizer and scheduler
+        optimizer = AdamW(self.model.parameters(), lr=self.learning_rate)
+        total_steps = len(train_loader) * self.epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=0, num_training_steps=total_steps
         )
         
-        early_stop = tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=self.patience, restore_best_weights=True
-        )
+        criterion = nn.CrossEntropyLoss()
         
-        return self.model.fit(train_dataset, validation_data=val_dataset, 
-                            epochs=self.epochs, callbacks=[early_stop])
+        best_val_loss = float('inf')
+        patience_counter = 0
+        history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+        
+        for epoch in range(self.epochs):
+            # Training
+            self.model.train()
+            train_loss = 0
+            
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs}")
+            for batch in pbar:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                heuristic_features = batch['heuristic_features'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                optimizer.zero_grad()
+                outputs = self.model(input_ids, attention_mask, heuristic_features)
+                loss = criterion(outputs, labels)
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                
+                train_loss += loss.item()
+                pbar.set_postfix({'loss': loss.item()})
+            
+            avg_train_loss = train_loss / len(train_loader)
+            
+            # Validation
+            val_loss, val_acc = self._validate(val_loader, criterion)
+            
+            history['train_loss'].append(avg_train_loss)
+            history['val_loss'].append(val_loss)
+            history['val_acc'].append(val_acc)
+            
+            print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={val_loss:.4f}, Val Acc={val_acc:.4f}")
+            
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                self.best_model_state = self.model.state_dict()
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    self.model.load_state_dict(self.best_model_state)
+                    break
+        
+        return history
+    
+    def _validate(self, val_loader, criterion):
+        """Validate the model"""
+        self.model.eval()
+        val_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                heuristic_features = batch['heuristic_features'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask, heuristic_features)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                predictions = torch.argmax(outputs, dim=1)
+                correct += (predictions == labels).sum().item()
+                total += labels.size(0)
+        
+        return val_loss / len(val_loader), correct / total
     
     def evaluate(self, test_emails: List[EmailData]) -> Dict[str, float]:
         """Evaluate model on test set"""
-        test_dataset = self.prepare_dataset(test_emails).batch(self.batch_size)
-        predictions = self.model.predict(test_dataset)
-        predicted_labels = np.argmax(predictions, axis=1)
-        true_labels = [email.label for email in test_emails]
+        test_loader = self.create_dataloader(test_emails, shuffle=False)
         
-        report = classification_report(true_labels, predicted_labels, output_dict=True)
+        self.model.eval()
+        all_predictions = []
+        all_probabilities = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Evaluating"):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                heuristic_features = batch['heuristic_features'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask, heuristic_features)
+                probabilities = torch.softmax(outputs, dim=1)
+                predictions = torch.argmax(outputs, dim=1)
+                
+                all_predictions.extend(predictions.cpu().numpy())
+                all_probabilities.extend(probabilities[:, 1].cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        report = classification_report(all_labels, all_predictions, output_dict=True)
         
         return {
             'accuracy': report['accuracy'],
             'precision': report['1']['precision'],
             'recall': report['1']['recall'],
             'f1_score': report['1']['f1-score'],
-            'auc_roc': roc_auc_score(true_labels, predictions[:, 1]),
-            'confusion_matrix': confusion_matrix(true_labels, predicted_labels)
+            'auc_roc': roc_auc_score(all_labels, all_probabilities),
+            'confusion_matrix': confusion_matrix(all_labels, all_predictions)
         }
     
     def predict(self, email: EmailData) -> Tuple[int, float]:
         """Predict single email"""
-        dataset = self.prepare_dataset([email]).batch(1)
-        prediction = self.model.predict(dataset)
-        return np.argmax(prediction), np.max(prediction)
+        self.model.eval()
+        text = self.preprocessor.preprocess(email)
+        
+        encoding = self.tokenizer(
+            text, truncation=True, padding='max_length',
+            max_length=self.max_length, return_tensors='pt'
+        )
+        
+        heuristic_features = list(self.feature_extractor.extract_features(email).values())
+        heuristic_tensor = torch.tensor([heuristic_features], dtype=torch.float32)
+        
+        with torch.no_grad():
+            input_ids = encoding['input_ids'].to(self.device)
+            attention_mask = encoding['attention_mask'].to(self.device)
+            heuristic_tensor = heuristic_tensor.to(self.device)
+            
+            outputs = self.model(input_ids, attention_mask, heuristic_tensor)
+            probabilities = torch.softmax(outputs, dim=1)
+            prediction = torch.argmax(probabilities, dim=1)
+        
+        return prediction.item(), probabilities[0, prediction].item()
     
     def save_model(self, path: str):
         """Save model weights"""
-        self.model.save_weights(path)
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'model_name': self.model_name
+        }, path)
+        print(f"Model saved to {path}")
     
     def load_model(self, path: str):
         """Load model weights"""
-        self.model.load_weights(path)
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
+        print(f"Model loaded from {path}")
 
 
 # ============================================================================
@@ -344,7 +501,7 @@ class ExperimentRunner:
         print("\n=== Approach 1: BERTurk on Translated Turkish ===")
         
         turkish_emails = translator.batch_translate_dataset(english_emails)
-        train, val, test = DataLoader("").split_data(turkish_emails)
+        train, val, test = DataLoaderUtil("").split_data(turkish_emails)
         
         params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 16, 'epochs': 3}
         detector = PhishingDetector(model_name="dbmdz/bert-base-turkish-cased", **params)
@@ -353,7 +510,7 @@ class ExperimentRunner:
         results = detector.evaluate(test)
         
         self.results['approach_1_translated'] = results
-        detector.save_model(f"{self.output_dir}/approach1_model")
+        detector.save_model(f"{self.output_dir}/approach1_model.pt")
         
         return results
     
@@ -364,8 +521,8 @@ class ExperimentRunner:
         mode = "zero-shot" if few_shot_samples == 0 else f"few-shot-{few_shot_samples}"
         print(f"\n=== Approach 2: XLM-R Multilingual ({mode}) ===")
         
-        train_en, val_en, _ = DataLoader("").split_data(english_emails)
-        train_tr, val_tr, test_tr = DataLoader("").split_data(translated_emails)
+        train_en, val_en, _ = DataLoaderUtil("").split_data(english_emails)
+        train_tr, val_tr, test_tr = DataLoaderUtil("").split_data(translated_emails)
         
         params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 16, 'epochs': 3}
         detector = PhishingDetector(model_name="xlm-roberta-base", **params)
@@ -380,7 +537,7 @@ class ExperimentRunner:
         results = detector.evaluate(test_tr)
         
         self.results[f'approach_2_{mode}'] = results
-        detector.save_model(f"{self.output_dir}/approach2_{mode}_model")
+        detector.save_model(f"{self.output_dir}/approach2_{mode}_model.pt")
         
         return results
     
@@ -403,10 +560,12 @@ class ExperimentRunner:
 
 def main():
     """Main execution pipeline"""
-    print("Initializing Turkish Phishing Detection Project...")
+    print("Initializing Turkish Phishing Detection Project (PyTorch)...")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
     
     # Load and translate data
-    loader = DataLoader("path/to/english/dataset")
+    loader = DataLoaderUtil("path/to/english/dataset")
     english_emails = loader.load_english_dataset()
     
     translator = MachineTranslator()
