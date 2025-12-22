@@ -6,8 +6,9 @@ PyTorch Implementation with Transformer Models
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoModel, AutoTokenizer, MarianMTModel, MarianTokenizer
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModel
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
 import pandas as pd
 import numpy as np
 import re
@@ -67,12 +68,21 @@ class DataLoaderUtil:
 class MachineTranslator:
     """Handles translation from English to Turkish using Marian NMT"""
     
-    def __init__(self, device: str = None):
+    def __init__(self, model_path: str = "models/opus-mt-tc-big-en-tr", device: str = None):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        model_name = "Helsinki-NLP/opus-mt-en-tr"
-        self.tokenizer = MarianTokenizer.from_pretrained(model_name)
-        self.model = MarianMTModel.from_pretrained(model_name).to(self.device)
+        self.model_path = model_path
+        
+        print(f"Loading translation model from: {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True
+        )
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_path,
+            local_files_only=True
+        ).to(self.device)
         self.model.eval()
+        print("Translation model loaded successfully!")
     
     def translate_email(self, email: EmailData) -> EmailData:
         """Translate email while preserving URLs and metadata"""
@@ -568,7 +578,8 @@ def main():
     loader = DataLoaderUtil("path/to/english/dataset")
     english_emails = loader.load_english_dataset()
     
-    translator = MachineTranslator()
+    # Use local translation model
+    translator = MachineTranslator(model_path="models/opus-mt-tc-big-en-tr")
     translated_emails = translator.batch_translate_dataset(english_emails)
     
     # Run experiments

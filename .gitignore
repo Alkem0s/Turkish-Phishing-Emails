@@ -1,4 +1,6 @@
 /datasets
+/models
 /*.pdf
 /*.docx
 /*.xlsx
+/*.zip
