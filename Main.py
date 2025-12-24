@@ -3,6 +3,7 @@ Turkish Phishing Email Detection Project
 PyTorch Implementation with Transformer Models
 """
 
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -491,33 +492,41 @@ class EmailDataset(Dataset):
 # ============================================================================
 
 class TransformerClassifier(nn.Module):
-    """Transformer-based classifier with heuristic feature fusion"""
+    """Transformer-based classifier with OPTIONAL heuristic feature fusion"""
     
-    def __init__(self, model_name: str, num_labels: int = 2, heuristic_dim: int = 13, dropout: float = 0.3, freeze_layers: int = 0):
+    def __init__(self, model_name: str, num_labels: int = 2, 
+                 heuristic_dim: int = 13, dropout: float = 0.3, 
+                 freeze_layers: int = 0, use_heuristics: bool = True):
         super().__init__()
         self.model_name = model_name
+        self.use_heuristics = use_heuristics
+        
         self.transformer = AutoModel.from_pretrained(model_name)
         self.dropout = nn.Dropout(dropout)
-        self.heuristic_dense = nn.Linear(heuristic_dim, 32)
-        self.relu = nn.ReLU()
+        
+        # Only initialize heuristic layer if we are using it
+        if self.use_heuristics:
+            self.heuristic_dense = nn.Linear(heuristic_dim, 32)
+            self.relu = nn.ReLU()
 
+        # Freezing logic
         for param in self.transformer.embeddings.parameters():
             param.requires_grad = False
 
         if freeze_layers > 0:
             encoder_layers = self.transformer.encoder.layer
             freeze_layers = min(freeze_layers, len(encoder_layers))
-
             for layer in encoder_layers[:freeze_layers]:
                 for param in layer.parameters():
                     param.requires_grad = False
         
-        # Get transformer hidden size
+        # Calculate classifier input size
         hidden_size = self.transformer.config.hidden_size
-        self.classifier = nn.Linear(hidden_size + 32, num_labels)
+        classifier_input_dim = hidden_size + 32 if self.use_heuristics else hidden_size
+        
+        self.classifier = nn.Linear(classifier_input_dim, num_labels)
     
     def forward(self, input_ids, attention_mask, heuristic_features):
-        """Forward pass combining transformer and heuristic features"""
         transformer_out = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask
@@ -525,10 +534,15 @@ class TransformerClassifier(nn.Module):
         
         # Use [CLS] token representation
         pooled = self.dropout(transformer_out.last_hidden_state[:, 0, :])
-        heuristic = self.relu(self.heuristic_dense(heuristic_features))
-        combined = torch.cat([pooled, heuristic], dim=1)
         
-        return self.classifier(combined)
+        if self.use_heuristics:
+            # Fuse features
+            heuristic = self.relu(self.heuristic_dense(heuristic_features))
+            combined = torch.cat([pooled, heuristic], dim=1)
+            return self.classifier(combined)
+        else:
+            # Text only
+            return self.classifier(pooled)
 
 
 # ============================================================================
@@ -539,7 +553,7 @@ class PhishingDetector:
     """Main detector class for training and evaluation"""
     
     def __init__(self, model_name: str, max_length: int = 256, learning_rate: float = 2e-5,
-                 batch_size: int = 32, epochs: int = 3, patience: int = 2, freeze_layers: int = 0, device: str = None):
+                 batch_size: int = 32, epochs: int = 3, patience: int = 2, freeze_layers: int = 0, use_heuristics: bool = True, device: str = None):
         self.model_name = model_name
         self.max_length = max_length
         self.learning_rate = learning_rate
@@ -548,7 +562,13 @@ class PhishingDetector:
         self.patience = patience
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.model = TransformerClassifier(model_name, freeze_layers=freeze_layers).to(self.device)
+        # Pass the use_heuristics flag to the model
+        self.model = TransformerClassifier(
+            model_name, 
+            freeze_layers=freeze_layers, 
+            use_heuristics=use_heuristics
+        ).to(self.device)
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.preprocessor = TextPreprocessor()
         self.feature_extractor = HeuristicFeatureExtractor()
@@ -743,103 +763,164 @@ class PhishingDetector:
 # ============================================================================
 
 class ExperimentRunner:
-    """Run and compare different approaches"""
-    
     def __init__(self, output_dir: str = "./results"):
         self.output_dir = output_dir
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         os.makedirs(output_dir, exist_ok=True)
         self.results = {}
     
-    def run_approach_1_translated(self, translated_emails: List[EmailData], hyperparams: Dict = None):
-        """Approach 1: Train BERTurk on translated Turkish data"""
-        print("\n" + "="*80)
-        print("APPROACH 1: BERTurk on Translated Turkish Data")
-        print("="*80)
+    def run_experiment(self,
+                       exp_name: str,
+                       model_name: str,
+                       train_data: List[EmailData],
+                       val_data: List[EmailData],
+                       test_data: List[EmailData],
+                       use_heuristics: bool,
+                       freeze_layers: int = 0,
+                       hyperparams: Dict = None):
         
-        train, val, test = DataLoaderUtil("").split_data(translated_emails)
+        print(f"\nRunning Experiment: {exp_name}")
+        print("-" * 50)
+        print(f"Model: {model_name}")
+        print(f"Heuristics: {use_heuristics}")
+        print(f"Training Size: {len(train_data)}")
         
-        params = hyperparams or {'learning_rate': 3e-5, 'batch_size': 32, 'epochs': 3, 'patience': 1}
-        detector = PhishingDetector(model_name="dbmdz/bert-base-turkish-cased", freeze_layers=6, **params)
+        params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 32, 'epochs': 3, 'patience': 2}
         
-        print("\nTraining model...")
-        detector.train(train, val)
+        detector = PhishingDetector(
+            model_name=model_name, 
+            freeze_layers=freeze_layers, 
+            use_heuristics=use_heuristics,
+            **params
+        )
         
-        print("\nEvaluating model...")
-        results = detector.evaluate(test)
-        
-        detector.save_model(f"{self.output_dir}/approach1_model.pt")
-        self.results['approach_1_translated'] = {
-            "model": "dbmdz/bert-base-turkish-cased",
-            "freeze_layers": 6,
-            "hyperparameters": params,
-            "metrics": results
-        }
-        
-        return results
-    
-    def run_approach_2_multilingual(self, english_emails: List[EmailData],
-                                   translated_emails: List[EmailData],
-                                   hyperparams: Dict = None, few_shot_samples: int = 0):
-        """Approach 2: XLM-R multilingual transfer learning"""
-        mode = "zero-shot" if few_shot_samples == 0 else f"few-shot-{few_shot_samples}"
-        
-        print("\n" + "="*80)
-        print(f"APPROACH 2: XLM-R Multilingual ({mode.upper()})")
-        print("="*80)
-        
-        train_en, val_en, _ = DataLoaderUtil("").split_data(english_emails)
-        train_tr, val_tr, test_tr = DataLoaderUtil("").split_data(translated_emails)
-        
-        params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 32, 'epochs': 2, 'patience': 1}
-        detector = PhishingDetector(model_name="xlm-roberta-base", freeze_layers=8, **params)
-        
-        print("\nTraining on English data...")
-        detector.train(train_en, val_en)
-        
-        if few_shot_samples > 0:
-            print(f"\nFine-tuning on {few_shot_samples} Turkish samples...")
-            detector.epochs = 5
-            detector.learning_rate = 1e-5
-            detector.freeze_layers = 10
-            detector.train(train_tr[:few_shot_samples], val_tr)
-        
-        print("\nEvaluating on Turkish test set...")
-        results = detector.evaluate(test_tr)
-        
-        self.results[f'approach_2_{mode}'] = {
-            "model": "xlm-roberta-base",
-            "freeze_layers": 8 if few_shot_samples == 0 else 10,
-            "hyperparameters": params,
-            "few_shot_samples": few_shot_samples,
-            "metrics": results
-        }
-        detector.save_model(f"{self.output_dir}/approach2_{mode}_model.pt")
-        
-        return results
-    
-    def compare_results(self):
-        """Print and save comparison of all approaches"""
-        print("\n" + "="*80)
-        print("FINAL RESULTS COMPARISON")
-        print("="*80 + "\n")
-        
-        df = pd.DataFrame(self.results).T
-        metrics = ['accuracy', 'precision', 'recall', 'f1_score', 'auc_roc']
-        
-        print(df[metrics].round(4))
-        print("\n")
+        detector.train(train_data, val_data)
+        metrics = detector.evaluate(test_data)
         
         # Save results
-        df.to_csv(f"{self.output_dir}/comparison_results.csv")
+        self.results[exp_name] = {
+            "model": model_name,
+            "use_heuristics": use_heuristics,
+            "train_size": len(train_data),
+            "metrics": metrics
+        }
         
-        json_path = f"{self.output_dir}/results_{self.run_id}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(self.results, f, indent=2)
+        # Save model
+        save_name = exp_name.replace(" ", "_").lower()
+        detector.save_model(f"{self.output_dir}/{save_name}.pt")
 
-        print(f"Results saved to {json_path}")
+    def run_all_experiments(self, english_emails, translated_emails):
         
-        return df
+        # Prepare Data Splits
+        # 1. Turkish Data (Target)
+        tr_train, tr_val, tr_test = DataLoaderUtil("").split_data(translated_emails)
+        
+        # 2. English Data (Source)
+        en_train, en_val, _ = DataLoaderUtil("").split_data(english_emails)
+        
+        # BERTurk No Heuristics
+        self.run_experiment(
+            exp_name="BERTurk_No_Heuristics",
+            model_name="dbmdz/bert-base-turkish-cased",
+            train_data=tr_train, val_data=tr_val, test_data=tr_test,
+            use_heuristics=False,
+            freeze_layers=4
+        )
+
+        # XLM-R Zero-Shot No Heuristics
+        self.run_experiment(
+            exp_name="XLMR_ZeroShot_No_Heuristics",
+            model_name="xlm-roberta-base",
+            train_data=en_train, val_data=en_val, test_data=tr_test,
+            use_heuristics=False,
+            freeze_layers=8
+        )
+
+        # XLM-R Zero-Shot With Heuristics
+        self.run_experiment(
+            exp_name="XLMR_ZeroShot_With_Heuristics",
+            model_name="xlm-roberta-base",
+            train_data=en_train, val_data=en_val, test_data=tr_test,
+            use_heuristics=True,
+            freeze_layers=8
+        )
+        
+        # Create dataset: 50 TR samples
+        few_shot_50 = tr_train[:50]
+        
+        # XLM-R Few-Shot (50 TR) No Heuristics
+        self.run_experiment(
+            exp_name="XLMR_FewShot_50TR_No_Heuristics",
+            model_name="xlm-roberta-base",
+            train_data=few_shot_50, val_data=tr_val[:50], test_data=tr_test,
+            use_heuristics=False,
+            freeze_layers=10, # Freeze more layers for small data
+            hyperparams={'learning_rate': 1e-5, 'batch_size': 16, 'epochs': 10, 'patience': 3}
+        )
+
+        # XLM-R Few-Shot (50 TR) With Heuristics
+        self.run_experiment(
+            exp_name="XLMR_FewShot_50TR_With_Heuristics",
+            model_name="xlm-roberta-base",
+            train_data=few_shot_50, val_data=tr_val[:50], test_data=tr_test,
+            use_heuristics=True,
+            freeze_layers=10,
+            hyperparams={'learning_rate': 1e-5, 'batch_size': 16, 'epochs': 10, 'patience': 3}
+        )
+        
+        # Create dataset: 100 TR + 200 EN
+        mixed_train = tr_train[:100] + en_train[:200]
+        random.shuffle(mixed_train)
+        
+        # Mixed Data XLM-R No Heuristics
+        self.run_experiment(
+            exp_name="XLMR_Mixed_100TR_200EN_No_Heuristics",
+            model_name="xlm-roberta-base",
+            train_data=mixed_train, val_data=tr_val, test_data=tr_test,
+            use_heuristics=False,
+            freeze_layers=8,
+            hyperparams={'learning_rate': 2e-5, 'batch_size': 32, 'epochs': 5, 'patience': 2}
+        )
+
+        # Compare Results
+        compare_results()
+
+        def compare_results(self):
+            """Print and save comparison of all approaches"""
+            print("\n" + "="*80)
+            print("FINAL RESULTS COMPARISON")
+            print("="*80 + "\n")
+
+            # Flatten metrics
+            rows = []
+            for name, result in self.results.items():
+                metrics = result.get("metrics", {})
+                row = {
+                    "approach": name,
+                    "accuracy": metrics.get("accuracy"),
+                    "precision": metrics.get("precision"),
+                    "recall": metrics.get("recall"),
+                    "f1_score": metrics.get("f1_score"),
+                    "auc_roc": metrics.get("auc_roc"),
+                }
+                rows.append(row)
+
+            df = pd.DataFrame(rows).set_index("approach")
+
+            print(df.round(4))
+            print("\n")
+
+            # Save results
+            os.makedirs(self.output_dir, exist_ok=True)
+            df.to_csv(f"{self.output_dir}/comparison_results.csv")
+
+            json_path = f"{self.output_dir}/results_{self.run_id}.json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(self.results, f, indent=2)
+
+            print(f"Results saved to {json_path}")
+
+            return df
 
 
 # ============================================================================
@@ -849,8 +930,10 @@ class ExperimentRunner:
 def main():
     """Main execution pipeline"""
     print("="*80)
-    print("Turkish Phishing Detection Project (PyTorch)")
+    print("Turkish Phishing Detection Project")
     print("="*80)
+    
+    # Hardware check
     print(f"PyTorch version: {torch.__version__}")
     print("CUDA available:", torch.cuda.is_available())
     if torch.cuda.is_available():
@@ -862,12 +945,20 @@ def main():
     DATASET_PATH = "datasets/ByNaser/CEAS_08.csv"
     TRANSLATION_CACHE = "./results/translated_emails.pkl"
 
-    # Step 1: Load English dataset
-    print("Step 1: Loading dataset...")
+    # ------------------------------------------------------
+    # Step 1: Load English Dataset
+    # ------------------------------------------------------
+    print("Step 1: Loading source dataset...")
     loader = DataLoaderUtil(DATASET_PATH)
-    english_emails = loader.load_english_dataset()
+    try:
+        english_emails = loader.load_english_dataset()
+    except Exception as e:
+        print(f"Critical Error: Failed to load dataset. {e}")
+        return
 
-    # Step 2: Load or create translated dataset
+    # ------------------------------------------------------
+    # Step 2: Prepare Translated Dataset
+    # ------------------------------------------------------
     print("\nStep 2: Preparing translated dataset...")
 
     if os.path.exists(TRANSLATION_CACHE):
@@ -877,6 +968,7 @@ def main():
         print(f"Loaded {len(translated_emails)} translated emails")
     else:
         print("No cached translations found — running machine translation")
+        # Initialize translator only if needed to save VRAM
         translator = MachineTranslator(
             batch_size=32,
             max_length=128
@@ -886,48 +978,30 @@ def main():
             english_emails,
             save_path=TRANSLATION_CACHE
         )
+        
+        # Free up VRAM after translation is done
+        del translator
+        torch.cuda.empty_cache()
 
-    # Step 3: Run experiments
+    # ------------------------------------------------------
+    # Step 3: Run Experiment
+    # ------------------------------------------------------
+    print("\n" + "="*80)
+    print("STARTING EXPERIMENTS")
+    print("="*80)
+    
+    # Initialize the runner
     runner = ExperimentRunner(output_dir="./results")
 
-    print("\n" + "="*80)
-    print("RUNNING EXPERIMENTS")
-    print("="*80)
-
-    # Approach 1: BERTurk on translated Turkish data
-    runner.run_approach_1_translated(translated_emails)
-
-    # Approach 2: Multilingual transfer (XLM-R)
-    runner.run_approach_2_multilingual(
-        english_emails,
-        translated_emails,
-        few_shot_samples=0
-    )
-
-    runner.run_approach_2_multilingual(
-        english_emails,
-        translated_emails,
-        few_shot_samples=50
-    )
-
-    runner.run_approach_2_multilingual(
-        english_emails,
-        translated_emails,
-        few_shot_samples=100
-    )
-
-    # Step 4: Compare results
-    print("\n" + "="*80)
-    print("COMPARING ALL APPROACHES")
-    print("="*80)
-    runner.compare_results()
-
-    print("\n" + "="*80)
-    print("EXECUTION COMPLETE!")
-    print("All results saved to ./results/")
-    print("="*80)
-
+    # Run the full ablation study
+    runner.run_all_experiments(english_emails, translated_emails)
 
 
 if __name__ == "__main__":
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    
     main()
