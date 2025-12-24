@@ -1,6 +1,6 @@
 """
 Turkish Phishing Email Detection Project
-PyTorch Implementation with Transformer Models
+PyTorch Implementation with Transformer Models + TF-IDF Baseline
 """
 
 import random
@@ -17,6 +17,8 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 import pickle
 import warnings
 from tqdm import tqdm
@@ -450,6 +452,97 @@ class TextPreprocessor:
 
 
 # ============================================================================
+# TF-IDF BASELINE CLASSIFIER
+# ============================================================================
+
+class TFIDFClassifier:
+    """Traditional ML baseline using TF-IDF + Logistic Regression"""
+    
+    def __init__(self, max_features: int = 5000):
+        self.max_features = max_features
+        self.vectorizer = TfidfVectorizer(
+            max_features=max_features,
+            ngram_range=(1, 2),
+            min_df=2,
+            max_df=0.95
+        )
+        self.classifier = LogisticRegression(
+            max_iter=1000,
+            C=1.0,
+            random_state=42,
+            class_weight='balanced'
+        )
+        self.preprocessor = TextPreprocessor()
+    
+    def train(self, train_emails: List[EmailData], val_emails: List[EmailData] = None):
+        """Train TF-IDF + LR model"""
+        print("Extracting TF-IDF features from training data...")
+        
+        # Preprocess texts
+        train_texts = [self.preprocessor.preprocess(e) for e in train_emails]
+        train_labels = [e.label for e in train_emails]
+        
+        # Fit vectorizer and transform
+        X_train = self.vectorizer.fit_transform(train_texts)
+        
+        print(f"Training logistic regression on {X_train.shape[0]} samples with {X_train.shape[1]} features...")
+        self.classifier.fit(X_train, train_labels)
+        
+        # Validation accuracy if provided
+        if val_emails:
+            val_texts = [self.preprocessor.preprocess(e) for e in val_emails]
+            val_labels = [e.label for e in val_emails]
+            X_val = self.vectorizer.transform(val_texts)
+            val_acc = self.classifier.score(X_val, val_labels)
+            print(f"Validation accuracy: {val_acc:.4f}")
+    
+    def evaluate(self, test_emails: List[EmailData]) -> Dict[str, float]:
+        """Evaluate on test set"""
+        print("Evaluating TF-IDF model...")
+        
+        test_texts = [self.preprocessor.preprocess(e) for e in test_emails]
+        test_labels = [e.label for e in test_emails]
+        
+        X_test = self.vectorizer.transform(test_texts)
+        predictions = self.classifier.predict(X_test)
+        probabilities = self.classifier.predict_proba(X_test)[:, 1]
+        
+        report = classification_report(test_labels, predictions, output_dict=True)
+        cm = confusion_matrix(test_labels, predictions)
+        
+        print("\nClassification Report:")
+        print(classification_report(test_labels, predictions))
+        print(f"\nConfusion Matrix:\n{cm}")
+        
+        return {
+            'accuracy': report['accuracy'],
+            'precision': report['1']['precision'],
+            'recall': report['1']['recall'],
+            'f1_score': report['1']['f1-score'],
+            'auc_roc': roc_auc_score(test_labels, probabilities),
+            'confusion_matrix': cm.tolist()
+        }
+    
+    def save_model(self, path: str):
+        """Save vectorizer and classifier"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'vectorizer': self.vectorizer,
+                'classifier': self.classifier
+            }, f)
+        print(f"TF-IDF model saved to {path}")
+    
+    def load_model(self, path: str):
+        """Load vectorizer and classifier"""
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+            self.vectorizer = data['vectorizer']
+            self.classifier = data['classifier']
+        print(f"TF-IDF model loaded from {path}")
+
+
+# ============================================================================
 # PYTORCH DATASET
 # ============================================================================
 
@@ -769,6 +862,33 @@ class ExperimentRunner:
         os.makedirs(output_dir, exist_ok=True)
         self.results = {}
     
+    def run_tfidf_baseline(self,
+                          exp_name: str,
+                          train_data: List[EmailData],
+                          val_data: List[EmailData],
+                          test_data: List[EmailData]):
+        """Run TF-IDF + Logistic Regression baseline"""
+        print(f"\nRunning Baseline: {exp_name}")
+        print("-" * 50)
+        print(f"Method: TF-IDF + Logistic Regression")
+        print(f"Training Size: {len(train_data)}")
+        
+        classifier = TFIDFClassifier(max_features=5000)
+        classifier.train(train_data, val_data)
+        metrics = classifier.evaluate(test_data)
+        
+        # Save results
+        self.results[exp_name] = {
+            "model": "TF-IDF + Logistic Regression",
+            "use_heuristics": False,
+            "train_size": len(train_data),
+            "metrics": metrics
+        }
+        
+        # Save model
+        save_name = exp_name.replace(" ", "_").lower()
+        classifier.save_model(f"{self.output_dir}/{save_name}.pkl")
+    
     def run_experiment(self,
                        exp_name: str,
                        model_name: str,
@@ -817,6 +937,20 @@ class ExperimentRunner:
         
         # 2. English Data (Source)
         en_train, en_val, _ = DataLoaderUtil("").split_data(english_emails)
+        
+        # ======================================================================
+        # BASELINE: TF-IDF + Logistic Regression (Turkish)
+        # ======================================================================
+        self.run_tfidf_baseline(
+            exp_name="TFIDF_Turkish_Baseline",
+            train_data=tr_train,
+            val_data=tr_val,
+            test_data=tr_test
+        )
+        
+        # ======================================================================
+        # TRANSFORMER EXPERIMENTS
+        # ======================================================================
         
         # BERTurk No Heuristics
         self.run_experiment(
@@ -883,44 +1017,44 @@ class ExperimentRunner:
         )
 
         # Compare Results
-        compare_results()
+        self.compare_results()
 
-        def compare_results(self):
-            """Print and save comparison of all approaches"""
-            print("\n" + "="*80)
-            print("FINAL RESULTS COMPARISON")
-            print("="*80 + "\n")
+    def compare_results(self):
+        """Print and save comparison of all approaches"""
+        print("\n" + "="*80)
+        print("FINAL RESULTS COMPARISON")
+        print("="*80 + "\n")
 
-            # Flatten metrics
-            rows = []
-            for name, result in self.results.items():
-                metrics = result.get("metrics", {})
-                row = {
-                    "approach": name,
-                    "accuracy": metrics.get("accuracy"),
-                    "precision": metrics.get("precision"),
-                    "recall": metrics.get("recall"),
-                    "f1_score": metrics.get("f1_score"),
-                    "auc_roc": metrics.get("auc_roc"),
-                }
-                rows.append(row)
+        # Flatten metrics
+        rows = []
+        for name, result in self.results.items():
+            metrics = result.get("metrics", {})
+            row = {
+                "approach": name,
+                "accuracy": metrics.get("accuracy"),
+                "precision": metrics.get("precision"),
+                "recall": metrics.get("recall"),
+                "f1_score": metrics.get("f1_score"),
+                "auc_roc": metrics.get("auc_roc"),
+            }
+            rows.append(row)
 
-            df = pd.DataFrame(rows).set_index("approach")
+        df = pd.DataFrame(rows).set_index("approach")
 
-            print(df.round(4))
-            print("\n")
+        print(df.round(4))
+        print("\n")
 
-            # Save results
-            os.makedirs(self.output_dir, exist_ok=True)
-            df.to_csv(f"{self.output_dir}/comparison_results.csv")
+        # Save results
+        os.makedirs(self.output_dir, exist_ok=True)
+        df.to_csv(f"{self.output_dir}/comparison_results.csv")
 
-            json_path = f"{self.output_dir}/results_{self.run_id}.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(self.results, f, indent=2)
+        json_path = f"{self.output_dir}/results_{self.run_id}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(self.results, f, indent=2)
 
-            print(f"Results saved to {json_path}")
+        print(f"Results saved to {json_path}")
 
-            return df
+        return df
 
 
 # ============================================================================
@@ -967,7 +1101,7 @@ def main():
             translated_emails = pickle.load(f)
         print(f"Loaded {len(translated_emails)} translated emails")
     else:
-        print("No cached translations found — running machine translation")
+        print("No cached translations found – running machine translation")
         # Initialize translator only if needed to save VRAM
         translator = MachineTranslator(
             batch_size=32,
