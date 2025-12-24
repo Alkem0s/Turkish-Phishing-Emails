@@ -70,10 +70,15 @@ class DataLoaderUtil:
         if pd.isna(text) or not isinstance(text, str):
             return ""
         
-        # Remove extra whitespace
+        # 1. Remove extra whitespace
         text = re.sub(r'\s+', ' ', text)
-        # Remove control characters
+        
+        # 2. Remove control characters
         text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
+        
+        # 3. Remove standalone single digits
+        text = re.sub(r'\b\d\b', '', text)
+        
         return text.strip()
     
     def load_english_dataset(self) -> List[EmailData]:
@@ -92,8 +97,19 @@ class DataLoaderUtil:
             else:
                 raise ValueError("Could not decode file with any standard encoding")
             
-            print(f"Loaded {len(df)} emails")
-            print(f"Columns: {df.columns.tolist()}")
+            initial_count = len(df)
+            
+            # Drop rows where body is NaN
+            df = df.dropna(subset=['body'])
+            
+            # Removes rows where Subject AND Body are identical.
+            df = df.drop_duplicates(subset=['subject', 'body'], keep='first')
+            
+            dropped_count = initial_count - len(df)
+            if dropped_count > 0:
+                print(f"Dropped {dropped_count} duplicate/empty emails to prevent data leakage.")
+
+            print(f"Loaded {len(df)} unique emails")
             print(f"Label distribution:\n{df['label'].value_counts()}")
             
             # Convert to EmailData objects
@@ -128,7 +144,6 @@ class DataLoaderUtil:
                 emails.append(email)
             
             print(f"Successfully processed {len(emails)} emails")
-            print(f"Found {sum(len(e.urls) > 0 for e in emails)} emails with URLs")
             
             return emails
             
