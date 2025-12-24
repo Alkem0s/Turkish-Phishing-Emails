@@ -150,3 +150,66 @@ plt.savefig(f"{OUTPUT_DIR}/results_table.png", dpi=FIG_DPI)
 plt.close()
 
 print(f"Figures saved to: {OUTPUT_DIR}")
+
+# ============================
+# 5️ FEW-SHOT DEGRADATION CURVE
+# ============================
+
+DEGRADATION_DIR = "./results/few_shot_analysis"
+
+if os.path.exists(DEGRADATION_DIR):
+    degradation_files = sorted([
+        f for f in os.listdir(DEGRADATION_DIR)
+        if f.startswith("degradation_") and f.endswith(".json")
+    ])
+
+    if degradation_files:
+        # Load the most recent run
+        with open(os.path.join(DEGRADATION_DIR, degradation_files[-1]), "r") as f:
+            degradation = json.load(f)
+
+        rows = []
+        for exp in degradation["experiments"].values():
+            rows.append({
+                "samples": exp["sample_size"],
+                "TF-IDF": exp["tfidf"]["f1_score"],
+                "XLM-R": exp["xlmr"]["f1_score"]
+            })
+
+        deg_df = pd.DataFrame(rows).sort_values("samples")
+
+        plt.figure(figsize=(6, 4))
+        plt.plot(
+            deg_df["samples"],
+            deg_df["TF-IDF"],
+            marker="o",
+            linewidth=2,
+            label="TF-IDF + LR"
+        )
+        plt.plot(
+            deg_df["samples"],
+            deg_df["XLM-R"],
+            marker="s",
+            linewidth=2,
+            label="XLM-R"
+        )
+
+        plt.xlabel("Number of Turkish Training Samples")
+        plt.ylabel("F1 Score")
+        plt.title("Few-Shot Performance Degradation")
+        plt.ylim(0.0, 1.0)
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(
+            f"{OUTPUT_DIR}/few_shot_degradation.png",
+            dpi=FIG_DPI
+        )
+        plt.close()
+
+        print("Few-shot degradation figure saved.")
+    else:
+        print("No degradation result files found.")
+else:
+    print("Few-shot analysis directory not found.")

@@ -877,7 +877,6 @@ class ExperimentRunner:
         classifier.train(train_data, val_data)
         metrics = classifier.evaluate(test_data)
         
-        # Save results
         self.results[exp_name] = {
             "model": "TF-IDF + Logistic Regression",
             "use_heuristics": False,
@@ -885,7 +884,6 @@ class ExperimentRunner:
             "metrics": metrics
         }
         
-        # Save model
         save_name = exp_name.replace(" ", "_").lower()
         classifier.save_model(f"{self.output_dir}/{save_name}.pkl")
     
@@ -917,7 +915,6 @@ class ExperimentRunner:
         detector.train(train_data, val_data)
         metrics = detector.evaluate(test_data)
         
-        # Save results
         self.results[exp_name] = {
             "model": model_name,
             "use_heuristics": use_heuristics,
@@ -925,22 +922,16 @@ class ExperimentRunner:
             "metrics": metrics
         }
         
-        # Save model
         save_name = exp_name.replace(" ", "_").lower()
         detector.save_model(f"{self.output_dir}/{save_name}.pt")
 
     def run_all_experiments(self, english_emails, translated_emails):
         
-        # Prepare Data Splits
-        # 1. Turkish Data (Target)
         tr_train, tr_val, tr_test = DataLoaderUtil("").split_data(translated_emails)
         
-        # 2. English Data (Source)
         en_train, en_val, _ = DataLoaderUtil("").split_data(english_emails)
         
-        # ======================================================================
-        # BASELINE: TF-IDF + Logistic Regression (Turkish)
-        # ======================================================================
+        # TF-IDF Baseline on Turkish Data
         self.run_tfidf_baseline(
             exp_name="TFIDF_Turkish_Baseline",
             train_data=tr_train,
@@ -948,34 +939,21 @@ class ExperimentRunner:
             test_data=tr_test
         )
         
-        # ======================================================================
-        # TRANSFORMER EXPERIMENTS
-        # ======================================================================
-        
-        # BERTurk No Heuristics
+        # BERTurk
         self.run_experiment(
-            exp_name="BERTurk_No_Heuristics",
+            exp_name="BERTurk",
             model_name="dbmdz/bert-base-turkish-cased",
             train_data=tr_train, val_data=tr_val, test_data=tr_test,
             use_heuristics=False,
             freeze_layers=4
         )
 
-        # XLM-R Zero-Shot No Heuristics
+        # XLM-R Zero-Shot
         self.run_experiment(
-            exp_name="XLMR_ZeroShot_No_Heuristics",
+            exp_name="XLMR_ZeroShot",
             model_name="xlm-roberta-base",
             train_data=en_train, val_data=en_val, test_data=tr_test,
             use_heuristics=False,
-            freeze_layers=8
-        )
-
-        # XLM-R Zero-Shot With Heuristics
-        self.run_experiment(
-            exp_name="XLMR_ZeroShot_With_Heuristics",
-            model_name="xlm-roberta-base",
-            train_data=en_train, val_data=en_val, test_data=tr_test,
-            use_heuristics=True,
             freeze_layers=8
         )
         
@@ -1006,9 +984,9 @@ class ExperimentRunner:
         mixed_train = tr_train[:100] + en_train[:200]
         random.shuffle(mixed_train)
         
-        # Mixed Data XLM-R No Heuristics
+        # Mixed Data XLM-R
         self.run_experiment(
-            exp_name="XLMR_Mixed_100TR_200EN_No_Heuristics",
+            exp_name="XLMR_Mixed_100TR_200EN",
             model_name="xlm-roberta-base",
             train_data=mixed_train, val_data=tr_val, test_data=tr_test,
             use_heuristics=False,
@@ -1055,6 +1033,125 @@ class ExperimentRunner:
         print(f"Results saved to {json_path}")
 
         return df
+
+# ============================================================================
+# FEW-SHOT DEGRADATION ANALYZER
+# ============================================================================
+
+class FewShotDegradationAnalyzer:
+    
+    def __init__(self, output_dir: str = "./results/few_shot_analysis"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.results = {"experiments": {}}
+    
+    def run_analysis(self, tr_train: List, tr_val: List, tr_test: List,
+                    sample_sizes: List[int] = [10, 25, 50, 100],
+                    num_trials: int = 3):
+        
+        print(f"\nFew-Shot Degradation: {sample_sizes}, {num_trials} trials each\n")
+        
+        fixed_val = self._sample_balanced(tr_val, 200)
+
+        for size in sample_sizes:
+            print(f"n={size}...", end=" ", flush=True)
+            
+            tfidf_trials = []
+            xlmr_trials = []
+            
+            for trial in range(num_trials):
+                sampled_train = self._sample_balanced(tr_train, size)
+                sampled_val = fixed_val
+                
+                tfidf_metrics = self._train_tfidf(sampled_train, sampled_val, tr_test)
+                xlmr_metrics = self._train_xlmr(sampled_train, sampled_val, tr_test, freeze_layers = 12 if size <= 25 else 8)
+                
+                tfidf_trials.append(tfidf_metrics)
+                xlmr_trials.append(xlmr_metrics)
+            
+            self.results["experiments"][f"n_{size}"] = {
+                "sample_size": size,
+                "tfidf": self._average_metrics(tfidf_trials),
+                "xlmr": self._average_metrics(xlmr_trials)
+            }
+            
+            print("Done")
+        
+        self._save_and_print()
+        return self.results
+    
+    def _sample_balanced(self, emails: List, n: int) -> List:
+        if n >= len(emails):
+            return emails
+        phishing = [e for e in emails if e.label == 1]
+        legitimate = [e for e in emails if e.label == 0]
+        n_per_class = n // 2
+        sampled = (random.sample(phishing, min(n_per_class, len(phishing))) +
+                random.sample(legitimate, min(n_per_class, len(legitimate))))
+        random.shuffle(sampled)
+        return sampled
+    
+    def _train_tfidf(self, train, val, test) -> Dict:
+        try:
+            clf = TFIDFClassifier(max_features=1000)
+            clf.train(train, val)
+            return clf.evaluate(test)
+        except:
+            return {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'auc_roc': 0}
+    
+    def _train_xlmr(self, train, val, test, freeze_layers) -> Dict:
+        try:
+            detector = PhishingDetector(
+                model_name="xlm-roberta-base",
+                use_heuristics=False,
+                freeze_layers=freeze_layers,
+                learning_rate=1e-5,
+                batch_size=16,
+                epochs=8,
+                patience=3
+            )
+            detector.train(train, val)
+            metrics = detector.evaluate(test)
+            del detector
+            torch.cuda.empty_cache()
+            return metrics
+        except:
+            return {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'auc_roc': 0}
+    
+    def _average_metrics(self, trials: List[Dict]) -> Dict:
+        n = len(trials)
+        return {
+            'accuracy': sum(t['accuracy'] for t in trials) / n,
+            'precision': sum(t['precision'] for t in trials) / n,
+            'recall': sum(t['recall'] for t in trials) / n,
+            'f1_score': sum(t['f1_score'] for t in trials) / n,
+            'auc_roc': sum(t['auc_roc'] for t in trials) / n
+        }
+    
+    def _save_and_print(self):
+        json_path = f"{self.output_dir}/few_shot_analysis/degradation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(json_path, "w") as f:
+            json.dump(self.results, f, indent=2)
+        
+        print(f"\n{'Size':<8} {'TF-IDF F1':<12} {'XLM-R F1':<12} {'Δ':<10}")
+        print("-" * 45)
+        for key in sorted(self.results["experiments"].keys(), 
+                        key=lambda x: self.results["experiments"][x]["sample_size"]):
+            exp = self.results["experiments"][key]
+            size = exp["sample_size"]
+            tfidf_f1 = exp["tfidf"]["f1_score"]
+            xlmr_f1 = exp["xlmr"]["f1_score"]
+            delta = xlmr_f1 - tfidf_f1
+            print(f"{size:<8} {tfidf_f1:<12.4f} {xlmr_f1:<12.4f} {delta:>+7.4f}")
+        print(f"\nSaved: {json_path}\n")
+
+
+def run_degradation_analysis(english_emails, translated_emails):
+    analyzer = FewShotDegradationAnalyzer()
+    tr_train, tr_val, tr_test = DataLoaderUtil("").split_data(translated_emails)
+
+    results = analyzer.run_analysis(tr_train, tr_val, tr_test)
+    return {"results": results}
 
 
 # ============================================================================
@@ -1129,6 +1226,9 @@ def main():
 
     # Run the full ablation study
     runner.run_all_experiments(english_emails, translated_emails)
+
+    # Run few-shot degradation analysis
+    run_degradation_analysis(english_emails, translated_emails)
 
 
 if __name__ == "__main__":
