@@ -12,13 +12,16 @@ from transformers import get_linear_schedule_with_warmup
 import pandas as pd
 import numpy as np
 import re
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 import pickle
 import warnings
 from tqdm import tqdm
+import os
+import json
+from datetime import datetime
 warnings.filterwarnings('ignore')
 
 
@@ -47,17 +50,122 @@ class DataLoaderUtil:
     def __init__(self, data_path: str):
         self.data_path = data_path
     
+    def extract_urls_from_text(self, text: str) -> List[str]:
+        """Extract URLs from email body text"""
+        if pd.isna(text) or not isinstance(text, str):
+            return []
+        
+        # Comprehensive URL pattern
+        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        urls = re.findall(url_pattern, text)
+        
+        # Also look for www. patterns without http
+        www_pattern = r'www\.(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        www_urls = re.findall(www_pattern, text)
+        
+        return list(set(urls + www_urls))
+    
+    def clean_text(self, text: str) -> str:
+        """Clean and normalize text"""
+        if pd.isna(text) or not isinstance(text, str):
+            return ""
+        
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove control characters
+        text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
+        return text.strip()
+    
     def load_english_dataset(self) -> List[EmailData]:
-        """Load English phishing dataset - implement based on your data format"""
-        # TODO: Implement dataset loading
-        # Example: df = pd.read_csv(self.data_path)
-        return []
+        """Load dataset"""
+        print(f"Loading dataset from: {self.data_path}")
+        
+        try:
+            # Try different encodings
+            for encoding in ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']:
+                try:
+                    df = pd.read_csv(self.data_path, encoding=encoding)
+                    print(f"Successfully loaded with {encoding} encoding")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                raise ValueError("Could not decode file with any standard encoding")
+            
+            print(f"Loaded {len(df)} emails")
+            print(f"Columns: {df.columns.tolist()}")
+            print(f"Label distribution:\n{df['label'].value_counts()}")
+            
+            # Convert to EmailData objects
+            emails = []
+            for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing emails"):
+                # Extract URLs from body
+                body_text = str(row['body']) if pd.notna(row['body']) else ""
+                urls = self.extract_urls_from_text(body_text)
+                
+                # Clean text fields
+                subject = self.clean_text(str(row['subject']) if pd.notna(row['subject']) else "")
+                body = self.clean_text(body_text)
+                sender = self.clean_text(str(row['sender']) if pd.notna(row['sender']) else "")
+                
+                # Create headers dict
+                headers = {
+                    'date': str(row['date']) if pd.notna(row['date']) else "",
+                    'receiver': str(row['receiver']) if pd.notna(row['receiver']) else ""
+                }
+                
+                # Get label (ensure it's 0 or 1)
+                label = int(row['label'])
+                
+                email = EmailData(
+                    subject=subject,
+                    body=body,
+                    sender=sender,
+                    headers=headers,
+                    urls=urls,
+                    label=label
+                )
+                emails.append(email)
+            
+            print(f"Successfully processed {len(emails)} emails")
+            print(f"Found {sum(len(e.urls) > 0 for e in emails)} emails with URLs")
+            
+            return emails
+            
+        except FileNotFoundError:
+            print(f"Error: File not found at {self.data_path}")
+            raise
+        except Exception as e:
+            print(f"Error loading dataset: {str(e)}")
+            raise
     
     def split_data(self, emails: List[EmailData], test_size: float = 0.15, 
                    val_size: float = 0.15, random_state: int = 42) -> Tuple[List, List, List]:
-        """Split data into train, validation, and test sets"""
-        train_val, test = train_test_split(emails, test_size=test_size, random_state=random_state)
-        train, val = train_test_split(train_val, test_size=val_size/(1-test_size), random_state=random_state)
+        """Split data into train, validation, and test sets with stratification"""
+        labels = [e.label for e in emails]
+        
+        # First split: separate test set
+        train_val, test = train_test_split(
+            emails, 
+            test_size=test_size, 
+            random_state=random_state,
+            stratify=labels
+        )
+        
+        # Second split: separate train and validation
+        train_val_labels = [e.label for e in train_val]
+        train, val = train_test_split(
+            train_val, 
+            test_size=val_size/(1-test_size), 
+            random_state=random_state,
+            stratify=train_val_labels
+        )
+        
+        print(f"\nData split:")
+        print(f"  Train: {len(train)} emails")
+        print(f"  Val:   {len(val)} emails")
+        print(f"  Test:  {len(test)} emails")
+        
         return train, val, test
 
 
@@ -66,64 +174,166 @@ class DataLoaderUtil:
 # ============================================================================
 
 class MachineTranslator:
-    """Handles translation from English to Turkish using Marian NMT"""
-    
-    def __init__(self, model_path: str = "models/opus-mt-tc-big-en-tr", device: str = None):
+    """Batched translation from English to Turkish using Marian NMT"""
+
+    def __init__(
+        self,
+        model_path: str = "models/opus-mt-tc-big-en-tr",
+        device: str = None,
+        batch_size: int = 32,
+        max_length: int = 128
+    ):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.batch_size = batch_size
+        self.max_length = max_length
         self.model_path = model_path
-        
+
         print(f"Loading translation model from: {model_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            local_files_only=True
-        )
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_path,
-            local_files_only=True
-        ).to(self.device)
+
+        model_name = "Helsinki-NLP/opus-mt-tc-big-en-tr"
+                
+        if not os.path.exists(model_path):
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                force_download=True
+            )
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name,
+                force_download=True,
+                use_safetensors=True
+            )
+
+            os.makedirs(model_path, exist_ok=True)
+            self.tokenizer.save_pretrained(model_path)
+            self.model.save_pretrained(model_path)
+
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                local_files_only=True
+            )
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_path,
+                local_files_only=True,
+                use_safetensors=True
+            )
+
+        self.model.to(self.device)
         self.model.eval()
-        print("Translation model loaded successfully!")
-    
-    def translate_email(self, email: EmailData) -> EmailData:
-        """Translate email while preserving URLs and metadata"""
-        translated_subject = self._translate_text(email.subject)
-        translated_body = self._translate_with_urls(email.body, email.urls)
-        
-        return EmailData(
-            subject=translated_subject,
-            body=translated_body,
-            sender=email.sender,
-            headers=email.headers,
-            urls=email.urls,
-            label=email.label
+        if self.device == "cuda":
+            self.model = self.model.half()
+
+        print(f"Translator ready on {self.device}")
+
+    def _batch_translate_texts(self, texts: list[str], desc: str = "Translating") -> list[str]:
+        results = []
+
+        num_batches = (len(texts) + self.batch_size - 1) // self.batch_size
+
+        for i in tqdm(
+            range(0, len(texts), self.batch_size),
+            total=num_batches,
+            desc=desc
+        ):
+            batch = texts[i:i + self.batch_size]
+
+            inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=self.max_length,
+                    num_beams=1,
+                    do_sample=False,
+                )
+
+            decoded = self.tokenizer.batch_decode(
+                outputs, skip_special_tokens=True
+            )
+            results.extend(decoded)
+
+        return results
+
+    def _protect_urls(self, text: str, urls: list[str]):
+        placeholders = {}
+        protected = text
+
+        for i, url in enumerate(urls):
+            token = f"__URL_{i}__"
+            placeholders[token] = url
+            protected = protected.replace(url, token)
+
+        return protected, placeholders
+
+    def _restore_urls(self, text: str, placeholders: dict):
+        restored = text
+        for token, url in placeholders.items():
+            restored = restored.replace(token, url)
+        return restored
+
+    def batch_translate_dataset(
+        self,
+        emails: list[EmailData],
+        save_path: str | None = None
+    ) -> list[EmailData]:
+
+        if save_path and os.path.exists(save_path):
+            print(f"Loading cached translations from {save_path}")
+            with open(save_path, "rb") as f:
+                return pickle.load(f)
+
+        print("Preparing texts for batched translation...")
+
+        subjects = [e.subject for e in emails]
+
+        protected_bodies = []
+        body_placeholders = []
+
+        for e in emails:
+            text, placeholders = self._protect_urls(e.body, e.urls)
+            protected_bodies.append(text)
+            body_placeholders.append(placeholders)
+
+        translated_subjects = self._batch_translate_texts(
+            subjects,
+            desc="Translating subjects"
         )
-    
-    def _translate_text(self, text: str) -> str:
-        """Translate plain text"""
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True, 
-                               truncation=True, max_length=512).to(self.device)
-        with torch.no_grad():
-            translated = self.model.generate(**inputs)
-        return self.tokenizer.decode(translated[0], skip_special_tokens=True)
-    
-    def _translate_with_urls(self, text: str, urls: List[str]) -> str:
-        """Translate text while preserving URLs"""
-        protected_text = text
-        placeholders = {url: f"__URL_{i}__" for i, url in enumerate(urls)}
-        
-        for url, placeholder in placeholders.items():
-            protected_text = protected_text.replace(url, placeholder)
-        
-        translated = self._translate_text(protected_text)
-        
-        for url, placeholder in placeholders.items():
-            translated = translated.replace(placeholder, url)
-        
-        return translated
-    
-    def batch_translate_dataset(self, emails: List[EmailData]) -> List[EmailData]:
-        """Translate entire dataset"""
-        return [self.translate_email(email) for email in tqdm(emails, desc="Translating")]
+
+        translated_bodies = self._batch_translate_texts(
+            protected_bodies,
+            desc="Translating bodies"
+        )
+
+        translated_emails = []
+        for i, e in enumerate(emails):
+            body = self._restore_urls(
+                translated_bodies[i], body_placeholders[i]
+            )
+
+            translated_emails.append(
+                EmailData(
+                    subject=translated_subjects[i],
+                    body=body,
+                    sender=e.sender,
+                    headers=e.headers,
+                    urls=e.urls,
+                    label=e.label
+                )
+            )
+
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, "wb") as f:
+                pickle.dump(translated_emails, f)
+            print(f"Saved translations to {save_path}")
+
+        return translated_emails
 
 
 # ============================================================================
@@ -136,9 +346,9 @@ class HeuristicFeatureExtractor:
     def __init__(self):
         self.patterns = {
             'urgency': ['urgent', 'immediately', 'action required', 'verify', 'suspend', 
-                       'acil', 'hemen', 'doğrula'],
+                       'acil', 'hemen', 'doğrula', 'expire', 'limited time'],
             'financial': ['bank', 'credit card', 'account', 'payment', 'banka', 
-                         'kredi kartı', 'hesap'],
+                         'kredi kartı', 'hesap', 'paypal', 'ebay', 'price'],
         }
     
     def extract_features(self, email: EmailData) -> Dict[str, float]:
@@ -148,16 +358,16 @@ class HeuristicFeatureExtractor:
         return {
             'urgency_score': sum(1 for w in self.patterns['urgency'] if w in text) / 3.0,
             'financial_score': sum(1 for w in self.patterns['financial'] if w in text) / 3.0,
-            'exclamation_count': text.count('!'),
+            'exclamation_count': min(text.count('!'), 5) / 5.0,
             'capitalization_ratio': sum(1 for c in text if c.isupper()) / max(len(text), 1),
-            'url_count': len(email.urls),
-            'has_suspicious_tld': float(any(url.endswith(('.tk', '.ml', '.ga', '.xyz')) for url in email.urls)),
-            'avg_url_length': sum(len(url) for url in email.urls) / max(len(email.urls), 1),
+            'url_count': min(len(email.urls), 10) / 10.0,
+            'has_suspicious_tld': float(any(url.endswith(('.tk', '.ml', '.ga', '.xyz', '.top')) for url in email.urls)),
+            'avg_url_length': min(sum(len(url) for url in email.urls) / max(len(email.urls), 1), 100) / 100.0,
             'has_ip_address': float(any(re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', url) for url in email.urls)),
-            'subject_length': len(email.subject),
-            'body_length': len(email.body),
+            'subject_length': min(len(email.subject), 200) / 200.0,
+            'body_length': min(len(email.body), 5000) / 5000.0,
             'has_html': float(bool(re.search(r'<[^>]+>', email.body))),
-            'link_ratio': sum(len(url) for url in email.urls) / max(len(email.body), 1),
+            'link_ratio': min(sum(len(url) for url in email.urls) / max(len(email.body), 1), 1.0),
             'sender_has_numbers': float(bool(re.search(r'\d', email.sender))),
         }
 
@@ -175,6 +385,7 @@ class TurkishLemmatizer:
             try:
                 import zeyrek
                 self.analyzer = zeyrek.MorphAnalyzer()
+                print("Zeyrek lemmatizer loaded successfully")
             except ImportError:
                 print("Warning: Zeyrek not installed. Skipping lemmatization.")
                 self.use_lemmatization = False
@@ -230,9 +441,16 @@ class EmailDataset(Dataset):
     """PyTorch Dataset for email data"""
     
     def __init__(self, emails: List[EmailData], tokenizer, preprocessor, 
-                 feature_extractor, max_length: int = 512):
+                 feature_extractor, max_length: int = 256):
         self.emails = emails
         self.tokenizer = tokenizer
+        self.encodings = tokenizer(
+            [preprocessor.preprocess(e) for e in emails],
+            truncation=True,
+            padding='max_length',
+            max_length=max_length,
+            return_tensors='pt'
+        )
         self.preprocessor = preprocessor
         self.feature_extractor = feature_extractor
         self.max_length = max_length
@@ -242,21 +460,12 @@ class EmailDataset(Dataset):
     
     def __getitem__(self, idx):
         email = self.emails[idx]
-        text = self.preprocessor.preprocess(email)
-        
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
         
         heuristic_features = list(self.feature_extractor.extract_features(email).values())
         
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
+            'input_ids': self.encodings['input_ids'][idx],
+            'attention_mask': self.encodings['attention_mask'][idx],
             'heuristic_features': torch.tensor(heuristic_features, dtype=torch.float32),
             'labels': torch.tensor(email.label, dtype=torch.long)
         }
@@ -269,13 +478,24 @@ class EmailDataset(Dataset):
 class TransformerClassifier(nn.Module):
     """Transformer-based classifier with heuristic feature fusion"""
     
-    def __init__(self, model_name: str, num_labels: int = 2, heuristic_dim: int = 13, dropout: float = 0.3):
+    def __init__(self, model_name: str, num_labels: int = 2, heuristic_dim: int = 13, dropout: float = 0.3, freeze_layers: int = 0):
         super().__init__()
         self.model_name = model_name
         self.transformer = AutoModel.from_pretrained(model_name)
         self.dropout = nn.Dropout(dropout)
         self.heuristic_dense = nn.Linear(heuristic_dim, 32)
         self.relu = nn.ReLU()
+
+        for param in self.transformer.embeddings.parameters():
+            param.requires_grad = False
+
+        if freeze_layers > 0:
+            encoder_layers = self.transformer.encoder.layer
+            freeze_layers = min(freeze_layers, len(encoder_layers))
+
+            for layer in encoder_layers[:freeze_layers]:
+                for param in layer.parameters():
+                    param.requires_grad = False
         
         # Get transformer hidden size
         hidden_size = self.transformer.config.hidden_size
@@ -303,8 +523,8 @@ class TransformerClassifier(nn.Module):
 class PhishingDetector:
     """Main detector class for training and evaluation"""
     
-    def __init__(self, model_name: str, max_length: int = 512, learning_rate: float = 2e-5,
-                 batch_size: int = 16, epochs: int = 3, patience: int = 2, device: str = None):
+    def __init__(self, model_name: str, max_length: int = 256, learning_rate: float = 2e-5,
+                 batch_size: int = 32, epochs: int = 3, patience: int = 2, freeze_layers: int = 0, device: str = None):
         self.model_name = model_name
         self.max_length = max_length
         self.learning_rate = learning_rate
@@ -312,13 +532,14 @@ class PhishingDetector:
         self.epochs = epochs
         self.patience = patience
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        self.model = TransformerClassifier(model_name).to(self.device)
+
+        self.model = TransformerClassifier(model_name, freeze_layers=freeze_layers).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.preprocessor = TextPreprocessor()
         self.feature_extractor = HeuristicFeatureExtractor()
         
         print(f"Using device: {self.device}")
+        print(f"Model: {model_name}")
     
     def create_dataloader(self, emails: List[EmailData], shuffle: bool = False) -> DataLoader:
         """Create PyTorch DataLoader"""
@@ -337,7 +558,9 @@ class PhishingDetector:
         optimizer = AdamW(self.model.parameters(), lr=self.learning_rate)
         total_steps = len(train_loader) * self.epochs
         scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=0, num_training_steps=total_steps
+            optimizer,
+            num_warmup_steps = int(0.1 * total_steps),
+            num_training_steps=total_steps
         )
         
         criterion = nn.CrossEntropyLoss()
@@ -444,6 +667,11 @@ class PhishingDetector:
                 all_labels.extend(labels.cpu().numpy())
         
         report = classification_report(all_labels, all_predictions, output_dict=True)
+        cm = confusion_matrix(all_labels, all_predictions)
+        
+        print("\nClassification Report:")
+        print(classification_report(all_labels, all_predictions))
+        print(f"\nConfusion Matrix:\n{cm}")
         
         return {
             'accuracy': report['accuracy'],
@@ -451,7 +679,7 @@ class PhishingDetector:
             'recall': report['1']['recall'],
             'f1_score': report['1']['f1-score'],
             'auc_roc': roc_auc_score(all_labels, all_probabilities),
-            'confusion_matrix': confusion_matrix(all_labels, all_predictions)
+            'confusion_matrix': cm.tolist()
         }
     
     def predict(self, email: EmailData) -> Tuple[int, float]:
@@ -480,6 +708,7 @@ class PhishingDetector:
     
     def save_model(self, path: str):
         """Save model weights"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'model_name': self.model_name
@@ -503,24 +732,34 @@ class ExperimentRunner:
     
     def __init__(self, output_dir: str = "./results"):
         self.output_dir = output_dir
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(output_dir, exist_ok=True)
         self.results = {}
     
-    def run_approach_1_translated(self, english_emails: List[EmailData], 
-                                  translator: MachineTranslator, hyperparams: Dict = None):
+    def run_approach_1_translated(self, translated_emails: List[EmailData], hyperparams: Dict = None):
         """Approach 1: Train BERTurk on translated Turkish data"""
-        print("\n=== Approach 1: BERTurk on Translated Turkish ===")
+        print("\n" + "="*80)
+        print("APPROACH 1: BERTurk on Translated Turkish Data")
+        print("="*80)
         
-        turkish_emails = translator.batch_translate_dataset(english_emails)
-        train, val, test = DataLoaderUtil("").split_data(turkish_emails)
+        train, val, test = DataLoaderUtil("").split_data(translated_emails)
         
-        params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 16, 'epochs': 3}
-        detector = PhishingDetector(model_name="dbmdz/bert-base-turkish-cased", **params)
+        params = hyperparams or {'learning_rate': 3e-5, 'batch_size': 32, 'epochs': 3, 'patience': 1}
+        detector = PhishingDetector(model_name="dbmdz/bert-base-turkish-cased", freeze_layers=6, **params)
         
+        print("\nTraining model...")
         detector.train(train, val)
+        
+        print("\nEvaluating model...")
         results = detector.evaluate(test)
         
-        self.results['approach_1_translated'] = results
         detector.save_model(f"{self.output_dir}/approach1_model.pt")
+        self.results['approach_1_translated'] = {
+            "model": "dbmdz/bert-base-turkish-cased",
+            "freeze_layers": 6,
+            "hyperparameters": params,
+            "metrics": results
+        }
         
         return results
     
@@ -529,24 +768,37 @@ class ExperimentRunner:
                                    hyperparams: Dict = None, few_shot_samples: int = 0):
         """Approach 2: XLM-R multilingual transfer learning"""
         mode = "zero-shot" if few_shot_samples == 0 else f"few-shot-{few_shot_samples}"
-        print(f"\n=== Approach 2: XLM-R Multilingual ({mode}) ===")
+        
+        print("\n" + "="*80)
+        print(f"APPROACH 2: XLM-R Multilingual ({mode.upper()})")
+        print("="*80)
         
         train_en, val_en, _ = DataLoaderUtil("").split_data(english_emails)
         train_tr, val_tr, test_tr = DataLoaderUtil("").split_data(translated_emails)
         
-        params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 16, 'epochs': 3}
-        detector = PhishingDetector(model_name="xlm-roberta-base", **params)
+        params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 32, 'epochs': 2, 'patience': 1}
+        detector = PhishingDetector(model_name="xlm-roberta-base", freeze_layers=8, **params)
         
+        print("\nTraining on English data...")
         detector.train(train_en, val_en)
         
         if few_shot_samples > 0:
-            detector.epochs = 2
+            print(f"\nFine-tuning on {few_shot_samples} Turkish samples...")
+            detector.epochs = 5
             detector.learning_rate = 1e-5
+            detector.freeze_layers = 10
             detector.train(train_tr[:few_shot_samples], val_tr)
         
+        print("\nEvaluating on Turkish test set...")
         results = detector.evaluate(test_tr)
         
-        self.results[f'approach_2_{mode}'] = results
+        self.results[f'approach_2_{mode}'] = {
+            "model": "xlm-roberta-base",
+            "freeze_layers": 8 if few_shot_samples == 0 else 10,
+            "hyperparameters": params,
+            "few_shot_samples": few_shot_samples,
+            "metrics": results
+        }
         detector.save_model(f"{self.output_dir}/approach2_{mode}_model.pt")
         
         return results
@@ -554,12 +806,23 @@ class ExperimentRunner:
     def compare_results(self):
         """Print and save comparison of all approaches"""
         print("\n" + "="*80)
-        print("RESULTS COMPARISON")
-        print("="*80)
+        print("FINAL RESULTS COMPARISON")
+        print("="*80 + "\n")
         
         df = pd.DataFrame(self.results).T
-        print(df[['accuracy', 'precision', 'recall', 'f1_score', 'auc_roc']])
+        metrics = ['accuracy', 'precision', 'recall', 'f1_score', 'auc_roc']
+        
+        print(df[metrics].round(4))
+        print("\n")
+        
+        # Save results
         df.to_csv(f"{self.output_dir}/comparison_results.csv")
+        
+        json_path = f"{self.output_dir}/results_{self.run_id}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(self.results, f, indent=2)
+
+        print(f"Results saved to {json_path}")
         
         return df
 
@@ -570,36 +833,85 @@ class ExperimentRunner:
 
 def main():
     """Main execution pipeline"""
-    print("Initializing Turkish Phishing Detection Project (PyTorch)...")
+    print("="*80)
+    print("Turkish Phishing Detection Project (PyTorch)")
+    print("="*80)
     print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    
-    # Load and translate data
-    loader = DataLoaderUtil("path/to/english/dataset")
+    print("CUDA available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("VRAM (GB):", torch.cuda.get_device_properties(0).total_memory / 1e9)
+    print("="*80 + "\n")
+
+    # Configuration
+    DATASET_PATH = "datasets/ByNaser/CEAS_08.csv"
+    TRANSLATION_CACHE = "./results/translated_emails.pkl"
+
+    # Step 1: Load English dataset
+    print("Step 1: Loading dataset...")
+    loader = DataLoaderUtil(DATASET_PATH)
     english_emails = loader.load_english_dataset()
-    
-    # Use local translation model
-    translator = MachineTranslator(model_path="models/opus-mt-tc-big-en-tr")
-    translated_emails = translator.batch_translate_dataset(english_emails)
-    
-    # Run experiments
+
+    # Step 2: Load or create translated dataset
+    print("\nStep 2: Preparing translated dataset...")
+
+    if os.path.exists(TRANSLATION_CACHE):
+        print(f"Found cached translations at {TRANSLATION_CACHE}")
+        with open(TRANSLATION_CACHE, "rb") as f:
+            translated_emails = pickle.load(f)
+        print(f"Loaded {len(translated_emails)} translated emails")
+    else:
+        print("No cached translations found — running machine translation")
+        translator = MachineTranslator(
+            batch_size=32,
+            max_length=128
+        )
+
+        translated_emails = translator.batch_translate_dataset(
+            english_emails,
+            save_path=TRANSLATION_CACHE
+        )
+
+    # Step 3: Run experiments
     runner = ExperimentRunner(output_dir="./results")
-    
-    # Approach 1: Translated data with BERTurk
-    runner.run_approach_1_translated(english_emails, translator)
-    
-    # Approach 2: Multilingual transfer with XLM-R
-    runner.run_approach_2_multilingual(english_emails, translated_emails, few_shot_samples=0)
-    runner.run_approach_2_multilingual(english_emails, translated_emails, few_shot_samples=50)
-    runner.run_approach_2_multilingual(english_emails, translated_emails, few_shot_samples=100)
-    
-    # Compare results
+
+    print("\n" + "="*80)
+    print("RUNNING EXPERIMENTS")
+    print("="*80)
+
+    # Approach 1: BERTurk on translated Turkish data
+    runner.run_approach_1_translated(translated_emails)
+
+    # Approach 2: Multilingual transfer (XLM-R)
+    runner.run_approach_2_multilingual(
+        english_emails,
+        translated_emails,
+        few_shot_samples=0
+    )
+
+    runner.run_approach_2_multilingual(
+        english_emails,
+        translated_emails,
+        few_shot_samples=50
+    )
+
+    runner.run_approach_2_multilingual(
+        english_emails,
+        translated_emails,
+        few_shot_samples=100
+    )
+
+    # Step 4: Compare results
+    print("\n" + "="*80)
+    print("COMPARING ALL APPROACHES")
+    print("="*80)
     runner.compare_results()
-    
+
     print("\n" + "="*80)
     print("EXECUTION COMPLETE!")
-    print(f"Results saved to ./results/")
+    print("All results saved to ./results/")
     print("="*80)
+
 
 
 if __name__ == "__main__":
