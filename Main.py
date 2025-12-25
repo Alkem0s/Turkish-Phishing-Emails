@@ -355,88 +355,14 @@ class MachineTranslator:
 
 
 # ============================================================================
-# HEURISTIC FEATURE EXTRACTION
-# ============================================================================
-
-class HeuristicFeatureExtractor:
-    """Extract security-relevant heuristic features from emails"""
-    
-    def __init__(self):
-        self.patterns = {
-            'urgency': ['urgent', 'immediately', 'action required', 'verify', 'suspend', 
-                       'acil', 'hemen', 'doğrula', 'expire', 'limited time'],
-            'financial': ['bank', 'credit card', 'account', 'payment', 'banka', 
-                         'kredi kartı', 'hesap', 'paypal', 'ebay', 'price'],
-        }
-    
-    def extract_features(self, email: EmailData) -> Dict[str, float]:
-        """Extract all heuristic features"""
-        text = f"{email.subject} {email.body}".lower()
-        
-        return {
-            'urgency_score': sum(1 for w in self.patterns['urgency'] if w in text) / 3.0,
-            'financial_score': sum(1 for w in self.patterns['financial'] if w in text) / 3.0,
-            'exclamation_count': min(text.count('!'), 5) / 5.0,
-            'capitalization_ratio': sum(1 for c in text if c.isupper()) / max(len(text), 1),
-            'url_count': min(len(email.urls), 10) / 10.0,
-            'has_suspicious_tld': float(any(url.endswith(('.tk', '.ml', '.ga', '.xyz', '.top')) for url in email.urls)),
-            'avg_url_length': min(sum(len(url) for url in email.urls) / max(len(email.urls), 1), 100) / 100.0,
-            'has_ip_address': float(any(re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', url) for url in email.urls)),
-            'subject_length': min(len(email.subject), 200) / 200.0,
-            'body_length': min(len(email.body), 5000) / 5000.0,
-            'has_html': float(bool(re.search(r'<[^>]+>', email.body))),
-            'link_ratio': min(sum(len(url) for url in email.urls) / max(len(email.body), 1), 1.0),
-            'sender_has_numbers': float(bool(re.search(r'\d', email.sender))),
-        }
-
-
-# ============================================================================
-# LEMMATIZATION
-# ============================================================================
-
-class TurkishLemmatizer:
-    """Turkish text lemmatization using Zeyrek"""
-    
-    def __init__(self, use_lemmatization: bool = False):
-        self.use_lemmatization = use_lemmatization
-        if use_lemmatization:
-            try:
-                import zeyrek
-                self.analyzer = zeyrek.MorphAnalyzer()
-                print("Zeyrek lemmatizer loaded successfully")
-            except ImportError:
-                print("Warning: Zeyrek not installed. Skipping lemmatization.")
-                self.use_lemmatization = False
-    
-    def lemmatize(self, text: str) -> str:
-        """Lemmatize Turkish text"""
-        if not self.use_lemmatization:
-            return text
-        
-        words = text.split()
-        lemmas = []
-        
-        for word in words:
-            try:
-                results = self.analyzer.lemmatize(word)
-                lemma = results[0][1][0] if results and results[0][1] else word
-                lemmas.append(lemma)
-            except:
-                lemmas.append(word)
-        
-        return ' '.join(lemmas)
-
-
-# ============================================================================
 # TEXT PREPROCESSING
 # ============================================================================
 
 class TextPreprocessor:
     """Preprocess text for model input"""
     
-    def __init__(self, lowercase: bool = True, use_lemmatization: bool = False):
+    def __init__(self, lowercase: bool = True):
         self.lowercase = lowercase
-        self.lemmatizer = TurkishLemmatizer(use_lemmatization)
     
     def preprocess(self, email: EmailData) -> str:
         """Preprocess email text"""
@@ -445,7 +371,6 @@ class TextPreprocessor:
         if self.lowercase:
             text = text.lower()
         
-        text = self.lemmatizer.lemmatize(text)
         text = re.sub(r'\s+', ' ', text).strip()
         
         return text
@@ -458,17 +383,20 @@ class TextPreprocessor:
 class TFIDFClassifier:
     """Traditional ML baseline using TF-IDF + Logistic Regression"""
     
-    def __init__(self, max_features: int = 5000):
+    def __init__(self, max_features: int = 5000, ngram_range: tuple = (1, 2), min_df: int = 2, max_df: float = 0.95, 
+                C: float = 1.0, max_iter: int = 1000, sublinear_tf: bool = True, solver: str = 'liblinear'):
         self.max_features = max_features
         self.vectorizer = TfidfVectorizer(
             max_features=max_features,
-            ngram_range=(1, 2),
-            min_df=2,
-            max_df=0.95
+            ngram_range=ngram_range,
+            min_df=min_df,
+            max_df=max_df,
+            sublinear_tf=sublinear_tf
         )
         self.classifier = LogisticRegression(
-            max_iter=1000,
-            C=1.0,
+            max_iter=max_iter,
+            C=C,
+            solver=solver,
             random_state=42,
             class_weight='balanced'
         )
@@ -549,8 +477,7 @@ class TFIDFClassifier:
 class EmailDataset(Dataset):
     """PyTorch Dataset for email data"""
     
-    def __init__(self, emails: List[EmailData], tokenizer, preprocessor, 
-                 feature_extractor, max_length: int = 256):
+    def __init__(self, emails: List[EmailData], tokenizer, preprocessor, max_length: int = 256):
         self.emails = emails
         self.tokenizer = tokenizer
         self.encodings = tokenizer(
@@ -561,7 +488,6 @@ class EmailDataset(Dataset):
             return_tensors='pt'
         )
         self.preprocessor = preprocessor
-        self.feature_extractor = feature_extractor
         self.max_length = max_length
     
     def __len__(self):
@@ -570,12 +496,9 @@ class EmailDataset(Dataset):
     def __getitem__(self, idx):
         email = self.emails[idx]
         
-        heuristic_features = list(self.feature_extractor.extract_features(email).values())
-        
         return {
             'input_ids': self.encodings['input_ids'][idx],
             'attention_mask': self.encodings['attention_mask'][idx],
-            'heuristic_features': torch.tensor(heuristic_features, dtype=torch.float32),
             'labels': torch.tensor(email.label, dtype=torch.long)
         }
 
@@ -585,23 +508,15 @@ class EmailDataset(Dataset):
 # ============================================================================
 
 class TransformerClassifier(nn.Module):
-    """Transformer-based classifier with OPTIONAL heuristic feature fusion"""
+    """Transformer-based classifier for phishing detection"""
     
-    def __init__(self, model_name: str, num_labels: int = 2, 
-                 heuristic_dim: int = 13, dropout: float = 0.3, 
-                 freeze_layers: int = 0, use_heuristics: bool = True):
+    def __init__(self, model_name: str, num_labels: int = 2, dropout: float = 0.3, freeze_layers: int = 0):
         super().__init__()
         self.model_name = model_name
-        self.use_heuristics = use_heuristics
         
         self.transformer = AutoModel.from_pretrained(model_name)
         self.dropout = nn.Dropout(dropout)
         
-        # Only initialize heuristic layer if we are using it
-        if self.use_heuristics:
-            self.heuristic_dense = nn.Linear(heuristic_dim, 32)
-            self.relu = nn.ReLU()
-
         # Freezing logic
         for param in self.transformer.embeddings.parameters():
             param.requires_grad = False
@@ -613,13 +528,11 @@ class TransformerClassifier(nn.Module):
                 for param in layer.parameters():
                     param.requires_grad = False
         
-        # Calculate classifier input size
+        # Classifier using transformer hidden size
         hidden_size = self.transformer.config.hidden_size
-        classifier_input_dim = hidden_size + 32 if self.use_heuristics else hidden_size
-        
-        self.classifier = nn.Linear(classifier_input_dim, num_labels)
+        self.classifier = nn.Linear(hidden_size, num_labels)
     
-    def forward(self, input_ids, attention_mask, heuristic_features):
+    def forward(self, input_ids, attention_mask):
         transformer_out = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask
@@ -628,14 +541,7 @@ class TransformerClassifier(nn.Module):
         # Use [CLS] token representation
         pooled = self.dropout(transformer_out.last_hidden_state[:, 0, :])
         
-        if self.use_heuristics:
-            # Fuse features
-            heuristic = self.relu(self.heuristic_dense(heuristic_features))
-            combined = torch.cat([pooled, heuristic], dim=1)
-            return self.classifier(combined)
-        else:
-            # Text only
-            return self.classifier(pooled)
+        return self.classifier(pooled)
 
 
 # ============================================================================
@@ -646,7 +552,7 @@ class PhishingDetector:
     """Main detector class for training and evaluation"""
     
     def __init__(self, model_name: str, max_length: int = 256, learning_rate: float = 2e-5,
-                 batch_size: int = 32, epochs: int = 3, patience: int = 2, freeze_layers: int = 0, use_heuristics: bool = True, device: str = None):
+                 batch_size: int = 32, epochs: int = 3, patience: int = 2, freeze_layers: int = 0, device: str = None):
         self.model_name = model_name
         self.max_length = max_length
         self.learning_rate = learning_rate
@@ -655,26 +561,16 @@ class PhishingDetector:
         self.patience = patience
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Pass the use_heuristics flag to the model
-        self.model = TransformerClassifier(
-            model_name, 
-            freeze_layers=freeze_layers, 
-            use_heuristics=use_heuristics
-        ).to(self.device)
-
+        self.model = TransformerClassifier(model_name, freeze_layers=freeze_layers).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.preprocessor = TextPreprocessor()
-        self.feature_extractor = HeuristicFeatureExtractor()
         
         print(f"Using device: {self.device}")
         print(f"Model: {model_name}")
     
     def create_dataloader(self, emails: List[EmailData], shuffle: bool = False) -> DataLoader:
         """Create PyTorch DataLoader"""
-        dataset = EmailDataset(
-            emails, self.tokenizer, self.preprocessor, 
-            self.feature_extractor, self.max_length
-        )
+        dataset = EmailDataset(emails, self.tokenizer, self.preprocessor, self.max_length)
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
     
     def train(self, train_emails: List[EmailData], val_emails: List[EmailData]):
@@ -690,9 +586,10 @@ class PhishingDetector:
             num_warmup_steps = int(0.1 * total_steps),
             num_training_steps=total_steps
         )
-        
-        criterion = nn.CrossEntropyLoss()
-        
+
+        weights = torch.tensor([1.0, 1.0]).to(self.device)
+        criterion = nn.CrossEntropyLoss(weight=weights)
+
         best_val_loss = float('inf')
         patience_counter = 0
         history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
@@ -706,11 +603,10 @@ class PhishingDetector:
             for batch in pbar:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                heuristic_features = batch['heuristic_features'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
                 optimizer.zero_grad()
-                outputs = self.model(input_ids, attention_mask, heuristic_features)
+                outputs = self.model(input_ids, attention_mask)
                 loss = criterion(outputs, labels)
                 
                 loss.backward()
@@ -757,10 +653,9 @@ class PhishingDetector:
             for batch in val_loader:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                heuristic_features = batch['heuristic_features'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                outputs = self.model(input_ids, attention_mask, heuristic_features)
+                outputs = self.model(input_ids, attention_mask)
                 loss = criterion(outputs, labels)
                 
                 val_loss += loss.item()
@@ -783,10 +678,9 @@ class PhishingDetector:
             for batch in tqdm(test_loader, desc="Evaluating"):
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                heuristic_features = batch['heuristic_features'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                outputs = self.model(input_ids, attention_mask, heuristic_features)
+                outputs = self.model(input_ids, attention_mask)
                 probabilities = torch.softmax(outputs, dim=1)
                 predictions = torch.argmax(outputs, dim=1)
                 
@@ -820,15 +714,11 @@ class PhishingDetector:
             max_length=self.max_length, return_tensors='pt'
         )
         
-        heuristic_features = list(self.feature_extractor.extract_features(email).values())
-        heuristic_tensor = torch.tensor([heuristic_features], dtype=torch.float32)
-        
         with torch.no_grad():
             input_ids = encoding['input_ids'].to(self.device)
             attention_mask = encoding['attention_mask'].to(self.device)
-            heuristic_tensor = heuristic_tensor.to(self.device)
             
-            outputs = self.model(input_ids, attention_mask, heuristic_tensor)
+            outputs = self.model(input_ids, attention_mask)
             probabilities = torch.softmax(outputs, dim=1)
             prediction = torch.argmax(probabilities, dim=1)
         
@@ -862,25 +752,34 @@ class ExperimentRunner:
         os.makedirs(output_dir, exist_ok=True)
         self.results = {}
     
-    def run_tfidf_baseline(self,
-                          exp_name: str,
-                          train_data: List[EmailData],
-                          val_data: List[EmailData],
-                          test_data: List[EmailData]):
-        """Run TF-IDF + Logistic Regression baseline"""
+    def run_tfidf(self,
+                      exp_name: str,
+                      train_data: List[EmailData],
+                      val_data: List[EmailData],
+                      test_data: List[EmailData],
+                      hyperparams: Dict = None):
+        """Run TF-IDF + Logistic Regression"""
         print(f"\nRunning Baseline: {exp_name}")
         print("-" * 50)
         print(f"Method: TF-IDF + Logistic Regression")
         print(f"Training Size: {len(train_data)}")
         
-        classifier = TFIDFClassifier(max_features=5000)
+        # Default params if not provided
+        params = hyperparams or {
+            'max_features': 5000,
+            'ngram_range': (1, 2),
+            'C': 1.0,
+            'max_iter': 1000,
+        }
+        
+        classifier = TFIDFClassifier(**params)
         classifier.train(train_data, val_data)
         metrics = classifier.evaluate(test_data)
         
         self.results[exp_name] = {
             "model": "TF-IDF + Logistic Regression",
-            "use_heuristics": False,
             "train_size": len(train_data),
+            "hyperparams": params,
             "metrics": metrics
         }
         
@@ -893,22 +792,19 @@ class ExperimentRunner:
                        train_data: List[EmailData],
                        val_data: List[EmailData],
                        test_data: List[EmailData],
-                       use_heuristics: bool,
                        freeze_layers: int = 0,
                        hyperparams: Dict = None):
         
         print(f"\nRunning Experiment: {exp_name}")
         print("-" * 50)
         print(f"Model: {model_name}")
-        print(f"Heuristics: {use_heuristics}")
         print(f"Training Size: {len(train_data)}")
         
         params = hyperparams or {'learning_rate': 2e-5, 'batch_size': 32, 'epochs': 3, 'patience': 2}
         
         detector = PhishingDetector(
             model_name=model_name, 
-            freeze_layers=freeze_layers, 
-            use_heuristics=use_heuristics,
+            freeze_layers=freeze_layers,
             **params
         )
         
@@ -917,7 +813,6 @@ class ExperimentRunner:
         
         self.results[exp_name] = {
             "model": model_name,
-            "use_heuristics": use_heuristics,
             "train_size": len(train_data),
             "metrics": metrics
         }
@@ -932,7 +827,7 @@ class ExperimentRunner:
         en_train, en_val, _ = DataLoaderUtil("").split_data(english_emails)
         
         # TF-IDF Baseline on Turkish Data
-        self.run_tfidf_baseline(
+        self.run_tfidf(
             exp_name="TFIDF_Turkish_Baseline",
             train_data=tr_train,
             val_data=tr_val,
@@ -944,7 +839,6 @@ class ExperimentRunner:
             exp_name="BERTurk",
             model_name="dbmdz/bert-base-turkish-cased",
             train_data=tr_train, val_data=tr_val, test_data=tr_test,
-            use_heuristics=False,
             freeze_layers=4
         )
 
@@ -953,31 +847,44 @@ class ExperimentRunner:
             exp_name="XLMR_ZeroShot",
             model_name="xlm-roberta-base",
             train_data=en_train, val_data=en_val, test_data=tr_test,
-            use_heuristics=False,
             freeze_layers=8
         )
         
         # Create dataset: 50 TR samples
-        few_shot_50 = tr_train[:50]
+        def sample_balanced(emails, n):
+            phishing = [e for e in emails if e.label == 1]
+            legit = [e for e in emails if e.label == 0]
+            k = n // 2
+            return random.sample(phishing, k) + random.sample(legit, k)
         
-        # XLM-R Few-Shot (50 TR) No Heuristics
-        self.run_experiment(
-            exp_name="XLMR_FewShot_50TR_No_Heuristics",
-            model_name="xlm-roberta-base",
-            train_data=few_shot_50, val_data=tr_val[:50], test_data=tr_test,
-            use_heuristics=False,
-            freeze_layers=10, # Freeze more layers for small data
-            hyperparams={'learning_rate': 1e-5, 'batch_size': 16, 'epochs': 10, 'patience': 3}
+        few_shot_50 = sample_balanced(tr_train, 50)
+        random.shuffle(few_shot_50)
+        
+        # TF-IDF Few-Shot (50 TR)
+        self.run_tfidf(
+            exp_name="TFIDF_FewShot_50TR",
+            train_data=few_shot_50,
+            val_data=tr_val[:300],
+            test_data=tr_test,
+            hyperparams={
+                'max_features': 3000,
+                'ngram_range': (1, 2),
+                'min_df': 1,
+                'max_df': 0.95,
+                'sublinear_tf': True,
+                'C': 1.0,
+                'max_iter': 1000,
+                'solver': 'liblinear'
+            }
         )
-
-        # XLM-R Few-Shot (50 TR) With Heuristics
+        
+        # XLM-R Few-Shot (50 TR)
         self.run_experiment(
-            exp_name="XLMR_FewShot_50TR_With_Heuristics",
+            exp_name="XLMR_FewShot_50TR",
             model_name="xlm-roberta-base",
-            train_data=few_shot_50, val_data=tr_val[:50], test_data=tr_test,
-            use_heuristics=True,
-            freeze_layers=10,
-            hyperparams={'learning_rate': 1e-5, 'batch_size': 16, 'epochs': 10, 'patience': 3}
+            train_data=few_shot_50, val_data=tr_val[:300], test_data=tr_test,
+            freeze_layers=8,
+            hyperparams={'learning_rate': 2e-5, 'batch_size': 16, 'epochs': 5, 'patience': 3}
         )
         
         # Create dataset: 100 TR + 200 EN
@@ -989,13 +896,12 @@ class ExperimentRunner:
             exp_name="XLMR_Mixed_100TR_200EN",
             model_name="xlm-roberta-base",
             train_data=mixed_train, val_data=tr_val, test_data=tr_test,
-            use_heuristics=False,
             freeze_layers=8,
             hyperparams={'learning_rate': 2e-5, 'batch_size': 32, 'epochs': 5, 'patience': 2}
         )
 
         # Compare Results
-        self.compare_results()
+        return self.compare_results()
 
     def compare_results(self):
         """Print and save comparison of all approaches"""
@@ -1034,125 +940,6 @@ class ExperimentRunner:
 
         return df
 
-# ============================================================================
-# FEW-SHOT DEGRADATION ANALYZER
-# ============================================================================
-
-class FewShotDegradationAnalyzer:
-    
-    def __init__(self, output_dir: str = "./results/few_shot_analysis"):
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        self.results = {"experiments": {}}
-    
-    def run_analysis(self, tr_train: List, tr_val: List, tr_test: List,
-                    sample_sizes: List[int] = [10, 25, 50, 100],
-                    num_trials: int = 3):
-        
-        print(f"\nFew-Shot Degradation: {sample_sizes}, {num_trials} trials each\n")
-        
-        fixed_val = self._sample_balanced(tr_val, 200)
-
-        for size in sample_sizes:
-            print(f"n={size}...", end=" ", flush=True)
-            
-            tfidf_trials = []
-            xlmr_trials = []
-            
-            for trial in range(num_trials):
-                sampled_train = self._sample_balanced(tr_train, size)
-                sampled_val = fixed_val
-                
-                tfidf_metrics = self._train_tfidf(sampled_train, sampled_val, tr_test)
-                xlmr_metrics = self._train_xlmr(sampled_train, sampled_val, tr_test, freeze_layers = 12 if size <= 25 else 8)
-                
-                tfidf_trials.append(tfidf_metrics)
-                xlmr_trials.append(xlmr_metrics)
-            
-            self.results["experiments"][f"n_{size}"] = {
-                "sample_size": size,
-                "tfidf": self._average_metrics(tfidf_trials),
-                "xlmr": self._average_metrics(xlmr_trials)
-            }
-            
-            print("Done")
-        
-        self._save_and_print()
-        return self.results
-    
-    def _sample_balanced(self, emails: List, n: int) -> List:
-        if n >= len(emails):
-            return emails
-        phishing = [e for e in emails if e.label == 1]
-        legitimate = [e for e in emails if e.label == 0]
-        n_per_class = n // 2
-        sampled = (random.sample(phishing, min(n_per_class, len(phishing))) +
-                random.sample(legitimate, min(n_per_class, len(legitimate))))
-        random.shuffle(sampled)
-        return sampled
-    
-    def _train_tfidf(self, train, val, test) -> Dict:
-        try:
-            clf = TFIDFClassifier(max_features=1000)
-            clf.train(train, val)
-            return clf.evaluate(test)
-        except:
-            return {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'auc_roc': 0}
-    
-    def _train_xlmr(self, train, val, test, freeze_layers) -> Dict:
-        try:
-            detector = PhishingDetector(
-                model_name="xlm-roberta-base",
-                use_heuristics=False,
-                freeze_layers=freeze_layers,
-                learning_rate=1e-5,
-                batch_size=16,
-                epochs=8,
-                patience=3
-            )
-            detector.train(train, val)
-            metrics = detector.evaluate(test)
-            del detector
-            torch.cuda.empty_cache()
-            return metrics
-        except:
-            return {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_score': 0, 'auc_roc': 0}
-    
-    def _average_metrics(self, trials: List[Dict]) -> Dict:
-        n = len(trials)
-        return {
-            'accuracy': sum(t['accuracy'] for t in trials) / n,
-            'precision': sum(t['precision'] for t in trials) / n,
-            'recall': sum(t['recall'] for t in trials) / n,
-            'f1_score': sum(t['f1_score'] for t in trials) / n,
-            'auc_roc': sum(t['auc_roc'] for t in trials) / n
-        }
-    
-    def _save_and_print(self):
-        json_path = f"{self.output_dir}/few_shot_analysis/degradation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(json_path, "w") as f:
-            json.dump(self.results, f, indent=2)
-        
-        print(f"\n{'Size':<8} {'TF-IDF F1':<12} {'XLM-R F1':<12} {'Δ':<10}")
-        print("-" * 45)
-        for key in sorted(self.results["experiments"].keys(), 
-                        key=lambda x: self.results["experiments"][x]["sample_size"]):
-            exp = self.results["experiments"][key]
-            size = exp["sample_size"]
-            tfidf_f1 = exp["tfidf"]["f1_score"]
-            xlmr_f1 = exp["xlmr"]["f1_score"]
-            delta = xlmr_f1 - tfidf_f1
-            print(f"{size:<8} {tfidf_f1:<12.4f} {xlmr_f1:<12.4f} {delta:>+7.4f}")
-        print(f"\nSaved: {json_path}\n")
-
-
-def run_degradation_analysis(english_emails, translated_emails):
-    analyzer = FewShotDegradationAnalyzer()
-    tr_train, tr_val, tr_test = DataLoaderUtil("").split_data(translated_emails)
-
-    results = analyzer.run_analysis(tr_train, tr_val, tr_test)
-    return {"results": results}
-
 
 # ============================================================================
 # MAIN EXECUTION
@@ -1176,9 +963,7 @@ def main():
     DATASET_PATH = "datasets/ByNaser/CEAS_08.csv"
     TRANSLATION_CACHE = "./results/translated_emails.pkl"
 
-    # ------------------------------------------------------
-    # Step 1: Load English Dataset
-    # ------------------------------------------------------
+    # Load English dataset
     print("Step 1: Loading source dataset...")
     loader = DataLoaderUtil(DATASET_PATH)
     try:
@@ -1187,9 +972,7 @@ def main():
         print(f"Critical Error: Failed to load dataset. {e}")
         return
 
-    # ------------------------------------------------------
-    # Step 2: Prepare Translated Dataset
-    # ------------------------------------------------------
+    # Prepare translated dataset
     print("\nStep 2: Preparing translated dataset...")
 
     if os.path.exists(TRANSLATION_CACHE):
@@ -1198,7 +981,7 @@ def main():
             translated_emails = pickle.load(f)
         print(f"Loaded {len(translated_emails)} translated emails")
     else:
-        print("No cached translations found – running machine translation")
+        print("No cached translations found — running machine translation")
         # Initialize translator only if needed to save VRAM
         translator = MachineTranslator(
             batch_size=32,
@@ -1214,9 +997,7 @@ def main():
         del translator
         torch.cuda.empty_cache()
 
-    # ------------------------------------------------------
-    # Step 3: Run Experiment
-    # ------------------------------------------------------
+    # Run Experiment
     print("\n" + "="*80)
     print("STARTING EXPERIMENTS")
     print("="*80)
@@ -1227,8 +1008,7 @@ def main():
     # Run the full ablation study
     runner.run_all_experiments(english_emails, translated_emails)
 
-    # Run few-shot degradation analysis
-    run_degradation_analysis(english_emails, translated_emails)
+    return
 
 
 if __name__ == "__main__":
