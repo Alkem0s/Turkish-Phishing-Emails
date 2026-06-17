@@ -1,0 +1,150 @@
+{
+  "TFIDF_Turkish_Baseline": {
+    "model": "TF-IDF + Logistic Regression",
+    "train_size": 27407,
+    "hyperparams": {
+      "max_features": 5000,
+      "ngram_range": [
+        1,
+        2
+      ],
+      "C": 1.0,
+      "max_iter": 1000
+    },
+    "metrics": {
+      "accuracy": 0.9882533197139939,
+      "precision": 0.9911206368646662,
+      "recall": 0.9877937137625877,
+      "f1_score": 0.9894543787253554,
+      "auc_roc": 0.9992829923120844,
+      "confusion_matrix": [
+        [
+          2568,
+          29
+        ],
+        [
+          40,
+          3237
+        ]
+      ]
+    }
+  },
+  "BERTurk": {
+    "model": "dbmdz/bert-base-turkish-cased",
+    "train_size": 27407,
+    "metrics": {
+      "accuracy": 0.9972761321075928,
+      "precision": 0.9975587427525175,
+      "recall": 0.9975587427525175,
+      "f1_score": 0.9975587427525175,
+      "auc_roc": 0.999928205228234,
+      "confusion_matrix": [
+        [
+          2589,
+          8
+        ],
+        [
+          8,
+          3269
+        ]
+      ]
+    }
+  },
+  "XLMR_ZeroShot": {
+    "model": "xlm-roberta-base",
+    "train_size": 27407,
+    "metrics": {
+      "accuracy": 0.9559073884916581,
+      "precision": 0.9736346516007532,
+      "recall": 0.9465974977113213,
+      "f1_score": 0.9599257310846356,
+      "auc_roc": 0.9947284306943682,
+      "confusion_matrix": [
+        [
+          2513,
+          84
+        ],
+        [
+          175,
+          3102
+        ]
+      ]
+    }
+  },
+  "TFIDF_FewShot_50TR": {
+    "model": "TF-IDF + Logistic Regression",
+    "train_size": 50,
+    "hyperparams": {
+      "max_features": 3000,
+      "ngram_range": [
+        1,
+        2
+      ],
+      "min_df": 1,
+      "max_df": 0.95,
+      "sublinear_tf": true,
+      "C": 1.0,
+      "max_iter": 1000,
+      "solver": "liblinear"
+    },
+    "metrics": {
+      "accuracy": 0.8220973782771536,
+      "precision": 0.9335664335664335,
+      "recall": 0.7332926457125419,
+      "f1_score": 0.8213980516151085,
+      "auc_roc": 0.9436374615483771,
+      "confusion_matrix": [
+        [
+          2426,
+          171
+        ],
+        [
+          874,
+          2403
+        ]
+      ]
+    }
+  },
+  "XLMR_FewShot_50TR": {
+    "model": "xlm-roberta-base",
+    "train_size": 50,
+    "metrics": {
+      "accuracy": 0.8435478379298604,
+      "precision": 0.7836862367661213,
+      "recall": 0.9938968568812938,
+      "f1_score": 0.8763621687071169,
+      "auc_roc": 0.9597198429351301,
+      "confusion_matrix": [
+        [
+          1698,
+          899
+        ],
+        [
+          20,
+          3257
+        ]
+      ]
+    }
+  },
+  "XLMR_Mixed_100TR_200EN": {
+    "model": "xlm-roberta-base",
+    "train_size": 300,
+    "metrics": {
+      "accuracy": 0.9402451481103167,
+      "precision": 0.915861284820921,
+      "recall": 0.9832163564235581,
+      "f1_score": 0.9483443708609272,
+      "auc_roc": 0.9842601419515419,
+      "confusion_matrix": [
+        [
+          2301,
+          296
+        ],
+        [
+          55,
+          3222
+        ]
+      ]
+    }
+  }
+}

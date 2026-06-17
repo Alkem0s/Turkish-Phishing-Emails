@@ -2,6 +2,8 @@ import glob
 import json
 import os
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
+from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 import seaborn as sns
 import pandas as pd
 import numpy as np
@@ -83,25 +85,49 @@ plt.close()
 # 2️ PRECISION vs RECALL
 # ============================
 
-plt.figure(figsize=(6, 6))
+fig, ax = plt.subplots(figsize=(7, 7))
+
 for _, row in df.iterrows():
-    plt.scatter(row["recall"], row["precision"], s=120)
-    plt.text(
-        row["recall"] + 0.002,
-        row["precision"] + 0.002,
+    ax.scatter(row["recall"], row["precision"], s=120)
+    ax.annotate(
         row["approach"],
+        (row["recall"], row["precision"]),
+        textcoords="offset points",
+        xytext=(6, 6),
         fontsize=9
     )
 
-plt.xlabel("Recall")
-plt.ylabel("Precision")
-plt.title("Precision–Recall Tradeoff")
-plt.xlim(0.85, 1.0)
-plt.ylim(0.85, 1.0)
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(f"{OUTPUT_DIR}/precision_recall.png", dpi=FIG_DPI)
+ax.set_xlabel("Recall")
+ax.set_ylabel("Precision")
+ax.set_title("Precision–Recall Tradeoff")
+
+# Limits with padding
+ax.set_xlim(0.84, 1.01)
+ax.set_ylim(0.84, 1.01)
+
+# Dense ticks + high precision
+ticks = np.arange(0.85, 1.001, 0.01)
+ax.set_xticks(ticks)
+ax.set_yticks(ticks)
+
+ax.xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+
+plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+
+# Equal aspect AND centered
+ax.set_aspect("equal", adjustable="box")
+ax.set_anchor("C")
+
+ax.tick_params(labelsize=10)
+ax.title.set_fontsize(14)
+
+ax.grid(True)
+
+plt.savefig(f"{OUTPUT_DIR}/precision_recall.png", dpi=FIG_DPI, bbox_inches="tight")
 plt.close()
+
+
 
 # ============================
 # 3️ CONFUSION MATRICES
